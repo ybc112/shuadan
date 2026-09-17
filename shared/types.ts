@@ -50,9 +50,15 @@ export interface RobotConfig {
   maxOpenNotional: number;
   maxOrderNotional: number;
   stopLossQuote: number;
+  /** 止损的按仓位比例阈值（占持仓名义额百分比），与 stopLossQuote 取小值生效 */
+  stopLossPercent: number;
   shockPercent: number;
   cooldownSeconds: number;
   makerFeeBps: number;
+  /** 库存偏斜系数：0=关闭；持仓越偏离零，中心价越往减仓方向偏（1 = 满仓时偏移整段单边半区间） */
+  inventorySkew: number;
+  /** 只减仓超时秒数：超过该时长仍未平掉就跨价成交；0 = 关闭，保持纯 Maker 语义 */
+  exitTimeoutSeconds: number;
 }
 
 export interface Robot extends RobotConfig {
@@ -127,6 +133,8 @@ export interface RiskSettings {
   maxDrawdownPercent: number;
   staleAfterSeconds: number;
   maxActionsPerMinute: number;
+  /** 全局熔断后是否自动平仓；false = 保留持仓交人工复核（原设计） */
+  flattenOnStop: boolean;
 }
 
 export interface QuoteAccount {

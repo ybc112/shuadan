@@ -42,7 +42,10 @@ export default function App() {
       if (active.current && seq === sequence.current) { setToken(next.sessionToken ?? ''); setState(next); setConnectionError(''); }
     } catch (error) { if (active.current && seq === sequence.current) setConnectionError(error instanceof Error ? error.message : '服务连接中断'); }
   }, []);
-  useEffect(() => { active.current = true; void refresh(); const timer = setInterval(() => void refresh(), 1500); return () => { active.current = false; clearInterval(timer); }; }, [refresh]);
+  // 轮询间隔。原来是 1500ms，但 /api/state 单次响应约 270KB：在只有 ~40KB/s 的公网链路上，
+  // 1.5 秒轮询的带宽需求是 358KB/s，请求永远追不上，页面会永久停在"正在载入"。
+  // 改成 3 秒后需求减半，配合服务端 gzip 才降到链路能力以内。
+  useEffect(() => { active.current = true; void refresh(); const timer = setInterval(() => void refresh(), 3000); return () => { active.current = false; clearInterval(timer); }; }, [refresh]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(null), toast.error ? 10000 : 6000); return () => clearTimeout(timer); }, [toast]);
 
   const command: Command = async (path, method = 'POST', body, success) => {

@@ -66,7 +66,12 @@ export function gridLevels(config: RobotConfig, market: Market, center = midPric
 }
 
 export function unrealized(robot: Robot, market?: Market): Decimal {
-  return market ? D(market.markPrice).minus(robot.entryPrice).mul(robot.positionQty) : D(0);
+  // entryPrice 为 0 时（持仓瞬间归零又被重建、币安尚未回传开仓价）不能拿来算浮亏：
+  // (markPrice - 0) × qty 会得出与市价同量级的巨额假浮亏——实测让 14 XRP 的持仓报出 -19 USDC，
+  // 凭空触发 10 USDC 止损并把机器人停掉。没有可信开仓价就返回 0，宁可这一拍不做止损判断。
+  const position = D(robot.positionQty), entry = D(robot.entryPrice);
+  if (!market || position.isZero() || !entry.isFinite() || entry.lte(0)) return D(0);
+  return D(market.markPrice).minus(entry).mul(position);
 }
 
 export function positionNotional(robot: Robot, market?: Market): Decimal {

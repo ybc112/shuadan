@@ -6,6 +6,7 @@ import { D, floorStep, gridLevels, makerPrice, midPrice, openingNotional, orderQ
 import { sampleMarkets } from './markets';
 import { ActionBudget } from './rate-limit';
 import type { BinanceTradingClient, FuturesOrder, UserTrade } from './binance-trading';
+import type { EquitySnapshot, TradeRecord } from './trade-log';
 
 export interface PersistedState {
   version: 1;
@@ -29,6 +30,16 @@ export interface PersistedState {
 }
 
 export type LiveBroker = BinanceTradingClient;
+
+/**
+ * 引擎对成交流水只依赖这个窄接口：便于测试注入，也避免引擎直接耦合 node:sqlite。
+ * record() 返回 false 表示该笔已存在（按 id 去重）。
+ */
+export interface TradeLogLike {
+  setRobotName(robotId: string, name: string): void;
+  record(trade: TradeRecord): boolean;
+  recordEquity(snapshot: EquitySnapshot): void;
+}
 
 export class MakerEngine {
   source: MarketSource = 'binance';
@@ -58,11 +69,20 @@ export class MakerEngine {
   private lastAccountSync = 0;
   private lastTradeSync = 0;
   private lastOrderSync = 0;
+  // 已发出但尚未在币安落地的撤单数（按 symbol）。撤单是异步的：不等它落地就挂新单，
+  // 新单会与被撤掉前仍挂在交易所的旧单自成交，被币安以 -5022 拒掉（实测 8 分钟 7 次）。
+  private pendingCancels = new Map<string, number>();
+  // 上一次实际生效的库存偏斜步长（按机器人），用于判断持仓变化是否需要重挂网格
+  private lastSkew = new Map<string, number>();
+  // 机器人进入只减仓的起始时间（按机器人），用于 exitTimeoutSeconds 超时后升级为跨价成交
+  private reduceSince = new Map<string, number>();
   // Cached live exchange identifiers so we can cancel our orders later.
   private liveOrderMeta = new Map<string, { orderId: string; clientOrderId: string; symbol: string }>();
   private liveBroker: LiveBroker | null = null;
   private liveSwitchInFlight = false;
   private lastTradesBySymbol = new Map<string, number>();
+  // 独立成交流水（SQLite）。为 null 时引擎行为完全不变，便于测试与纸面运行。
+  private tradeLog: TradeLogLike | null = null;
 
   constructor(saved?: PersistedState, now = Date.now()) {
     this.markets = [];
@@ -276,6 +296,8 @@ export class MakerEngine {
       for (const order of removed) {
         const meta = this.liveOrderMeta.get(order.id);
         if (!meta) continue;
+        const symbol = meta.symbol;
+        this.pendingCancels.set(symbol, (this.pendingCancels.get(symbol) ?? 0) + 1);
         this.liveBroker.cancelOrder(meta.symbol, meta.orderId, meta.clientOrderId)
           .then(() => this.liveOrderMeta.delete(order.id))
           .catch(error => {
@@ -284,23 +306,69 @@ export class MakerEngine {
             const isBenign = message.includes('订单被拒') || /订单不存在|unknown order/i.test(message);
             this.log(isBenign ? 'info' : 'warning', 'order',
               isBenign ? `撤单跳过（订单已完成或已不存在）` : `实盘撤单失败：${message}`, undefined, now);
+          })
+          .finally(() => {
+            const left = (this.pendingCancels.get(symbol) ?? 1) - 1;
+            if (left > 0) this.pendingCancels.set(symbol, left); else this.pendingCancels.delete(symbol);
           });
       }
     }
     return removed.length;
   }
 
+  /** 挂接独立成交流水。传 null 可断开（测试用）。 */
+  attachTradeLog(log: TradeLogLike | null) { this.tradeLog = log; }
+
+  /** 把成交写入流水。写入失败绝不能影响交易本身，且一分钟最多告警一次避免刷屏。 */
+  private recordTrade(fill: Fill, now: number) {
+    if (!this.tradeLog) return;
+    try {
+      const robot = this.robots.find(r => r.id === fill.robotId);
+      if (robot) this.tradeLog.setRobotName(robot.id, robot.name);
+      this.tradeLog.record(fill);
+    } catch (error) {
+      const key = 'trade-log';
+      if (now - (this.lastNotice.get(key) ?? 0) >= 60000) {
+        this.log('warning', 'system', `成交流水写入失败：${error instanceof Error ? error.message : error}`, undefined, now);
+        this.lastNotice.set(key, now);
+      }
+    }
+  }
+
   stopAll(reason = '用户触发紧急停止', now = Date.now()) {
     const count = this.cancelOrders(() => true, now);
     this.emergencyStopped = true; this.stopReason = reason;
-    this.robots.forEach(r => { r.status = 'paused'; r.reason = `${reason}；已撤单，持仓保留`; });
-    this.log('critical', 'risk', `${reason}：撤销 ${count} 笔挂单，禁止新增订单；持仓未平仓`, undefined, now);
+    // 注意：默认刻意「保留持仓、不自动平仓」——熔断触发时通常已在浮亏，自动平仓可能正好卖在低点，
+    // 所以交给人工复核（操作员可手动 reduce 或平仓，再解除停止）。
+    // 但实测这个默认值有代价：熔断后裸仓无人管理 6.9 小时、行情 -8%、亏损从 -0.6 扩大到 -5.56 U。
+    // 因此提供 settings.flattenOnStop 让运营者自行选择：开启后有持仓的机器人转入只减仓平掉。
+    const flatten = this.settings.flattenOnStop === true;
+    this.robots.forEach(r => {
+      if (flatten && !D(r.positionQty).isZero()) {
+        r.status = 'reduce_only'; r.lastQuoteAt = 0;
+        r.reason = `${reason}；已撤单，转入只减仓平掉持仓`;
+      } else {
+        r.status = 'paused'; r.reason = `${reason}；已撤单，持仓保留，请人工复核`;
+      }
+    });
+    this.log('critical', 'risk', `${reason}：撤销 ${count} 笔挂单，禁止新增订单；${flatten ? '有持仓的机器人转入只减仓' : '持仓未平仓'}`, undefined, now);
   }
 
-  clearStop(now = Date.now()) {
+  clearStop(now = Date.now(), rebaseline = false) {
     const summary = this.summary(now);
-    if (summary.dailyPnl <= -this.settings.dailyLossLimit || summary.drawdownPercent >= this.settings.maxDrawdownPercent) {
+    const breached = summary.dailyPnl <= -this.settings.dailyLossLimit || summary.drawdownPercent >= this.settings.maxDrawdownPercent;
+    if (breached && !rebaseline) {
       throw new Error('亏损或回撤仍超过风控上限；请先复核持仓和风控参数');
+    }
+    if (breached) {
+      // 人工复核后重置基准。原实现只抛错、不提供任何重置路径，导致回撤锁一旦触发就永久卡住：
+      // 实测 2026-09-15 平掉裸头寸后权益 49.38、峰值 52.21，回撤 5.4% 一直 > 5%，机器人再也启不起来。
+      // 操作员点击「解除停止」是显式行为，这里把当前权益设为新基准，并留下醒目日志。
+      this.peakEquity = String(summary.equity);
+      this.dailyStartEquity = String(summary.equity);
+      this.log('warning', 'risk',
+        `人工解除停止并重置风控基准：权益 ${summary.equity.toFixed(2)} U（回撤 ${summary.drawdownPercent.toFixed(2)}%，日内 ${summary.dailyPnl.toFixed(2)} U）`,
+        undefined, now);
     }
     this.emergencyStopped = false; this.stopReason = '';
     this.log('warning', 'risk', '已解除全局停止，所有机器人保持暂停，需手动启动', undefined, now);
@@ -486,7 +554,10 @@ export class MakerEngine {
     const notional = quantity.mul(price);
     // 已实现盈亏以币安返回为准，避免本地 entryPrice 被污染时算出假盈亏
     const realized = D(trade.realizedPnl).isFinite() ? D(trade.realizedPnl) : D(result.realizedPnl);
-    robot.positionQty = result.positionQty; robot.entryPrice = result.entryPrice;
+    // 持仓与开仓价只由 syncLiveAccount 以「币安绝对持仓」写入。此处若再按成交增量累加，
+    // 会把 syncLiveAccount 已经计入的同一笔成交重复计算，使本地持仓系统性虚高 1-2 笔；
+    // 虚高的持仓会让 positionNotional 提前越过上限，误触发只减仓。
+    // （实测：本地 28 对币安 21、本地 35 对币安 21，偏差恒为 1-2 个 orderSize）
     robot.realizedPnl = D(robot.realizedPnl).plus(realized).minus(fee).toFixed();
     robot.fees = D(robot.fees).plus(fee).toFixed();
     robot.filledNotional = D(robot.filledNotional).plus(notional).toFixed(); robot.fillCount++;
@@ -495,11 +566,13 @@ export class MakerEngine {
     if (this.liveAccount) {
       this.liveAccount.totalUnrealizedProfit = D(this.liveAccount.totalUnrealizedProfit).plus(realized).toFixed();
     }
-    this.fills.unshift({ id: dedupe, orderId: dedupe, robotId: robot.id, symbol: robot.symbol,
+    const fill: Fill = { id: dedupe, orderId: dedupe, robotId: robot.id, symbol: robot.symbol,
       side: trade.side, price: trade.price, quantity: trade.qty, fee: fee.toFixed(),
       realizedPnl: realized.toFixed(), time: trade.time, liquidity: trade.maker ? 'MAKER' : 'TAKER',
-      execution: 'LIVE', tradeId: trade.id !== undefined ? String(trade.id) : undefined });
+      execution: 'LIVE', tradeId: trade.id !== undefined ? String(trade.id) : undefined };
+    this.fills.unshift(fill);
     this.fills = this.fills.slice(0, 2000);
+    this.recordTrade(fill, now);
     this.log('info', 'order', `实盘 ${trade.side === 'BUY' ? '买入' : '卖出'} ${trade.qty} ${robot.symbol} @ ${trade.price}，手续费 ${trade.commission} ${trade.commissionAsset}`, robot, now);
   }
 
@@ -543,9 +616,11 @@ export class MakerEngine {
       order.remaining = D(order.remaining).minus(quantity).toFixed();
       order.status = 'PARTIALLY_FILLED';
       liquidity[order.side] = liquidity[order.side].minus(quantity);
-      this.fills.unshift({ id: randomUUID(), orderId: order.id, robotId: robot.id, symbol: robot.symbol,
+      const fill: Fill = { id: randomUUID(), orderId: order.id, robotId: robot.id, symbol: robot.symbol,
         side: order.side, price: order.price, quantity: quantity.toFixed(), fee: fee.toFixed(),
-        realizedPnl: netPnl.toFixed(), time: now, liquidity: 'MAKER', execution: 'SIMULATED' });
+        realizedPnl: netPnl.toFixed(), time: now, liquidity: 'MAKER', execution: 'SIMULATED' };
+      this.fills.unshift(fill);
+      this.recordTrade(fill, now);
       this.log('info', 'order', `纸面 ${order.side === 'BUY' ? '买入' : '卖出'} ${quantity.toFixed()} ${market.baseAsset} @ ${order.price}${order.reduceOnly ? ' · 只减仓' : ''}`, robot, now);
     }
     this.orders = this.orders.filter(o => D(o.remaining).gt(0));
@@ -599,7 +674,7 @@ export class MakerEngine {
       if (expired) this.log('info', 'order', `挂单到期，撤销 ${expired} 笔未成交剩余量`, robot, now);
     }
     this.enforceGlobal(now);
-    if (this.emergencyStopped) return;
+    // 停机时不再开新网格，但仍要允许只减仓把已有持仓平掉——否则每次熔断都留下裸头寸等人工处理。
     for (const robot of this.robots) {
       const market = this.markets.find(m => m.symbol === robot.symbol);
       const exposed = !D(robot.positionQty).isZero();
@@ -607,30 +682,90 @@ export class MakerEngine {
         if (robot.status === 'running' || robot.status === 'reduce_only' || exposed) this.cooldown(robot, '行情断流、过期或盘口无效', now);
         continue;
       }
-      if (robot.status === 'paused' || robot.status === 'cooldown') continue;
+      if (robot.status === 'paused') continue;
+      if (robot.status === 'cooldown') {
+        // 冷却结束后自动恢复。能走到这里说明行情已是新鲜的（上方 654 行的过期检查已过滤）。
+        // 原先这里是 `continue`，cooldown 只能靠人工 startRobot 解除：一次持续十几秒的网络抖动
+        // 就会撤掉全部挂单并让机器人整夜停摆，且握着裸仓位不挂任何保护单
+        // （实测 2026-09-14 03:57 与 05:00 两次，累计停摆数十分钟以上）。
+        // 亏损止损走的是 paused 分支，不受此处影响，仍然需要人工复核。
+        if (robot.cooldownUntil > now) continue;
+        robot.status = 'running'; robot.reason = '冷却结束、行情恢复，自动重新报价';
+        robot.lastQuoteAt = 0; robot.centerPrice = '0';
+        this.log('warning', 'risk', robot.reason, robot, now);
+      }
       const shock = this.shockPercent(market, now);
       if (shock >= robot.shockPercent) { this.cooldown(robot, '10 秒行情波动达到熔断阈值', now); continue; }
       if (D(market.markPrice).minus(midPrice(market)).abs().div(midPrice(market)).mul(100).gte(robot.shockPercent)) {
         this.cooldown(robot, '标记价格与盘口偏离超限', now); continue; }
       const loss = D(robot.realizedPnl).plus(unrealized(robot, market));
-      if (robot.status === 'running' && (loss.lte(-robot.stopLossQuote) || positionNotional(robot, market).gte(D(robot.maxPositionNotional).mul(0.8)))) {
+      // 两套止损各管一件事：
+      //   stopLossQuote（绝对额） -> 整个会话的累计亏损，防止持续失血
+      //   stopLossPercent（比例） -> 当前持仓的浮动亏损，防止单边行情里仓位越滚越亏
+      // 之前只有绝对额，配上 80 USDC 的仓位上限需要行情走 19%~75% 才触发，实测一整天 0 次。
+      const openLoss = unrealized(robot, market);
+      const openHit = this.openStopHit(robot, market, openLoss);
+      const totalHit = loss.lte(D(robot.stopLossQuote).neg());
+      const lossHit = openHit || totalHit;
+      if (robot.status === 'running' && (lossHit || positionNotional(robot, market).gte(D(robot.maxPositionNotional).mul(0.8)))) {
         this.cancelOrders(o => o.robotId === robot.id, now);
         robot.status = exposed ? 'reduce_only' : 'cooldown';
-        robot.reason = loss.lte(-robot.stopLossQuote) ? '机器人亏损达到上限，仅允许减仓' : '仓位达到上限的 80%，进入只减仓';
+        robot.reason = lossHit
+          ? (openHit
+            ? `持仓浮亏达到上限（阈值 ${positionNotional(robot, market).mul(robot.stopLossPercent).div(100).toFixed(4)} U，持仓 ${positionNotional(robot, market).toFixed(2)} U），仅允许减仓`
+            : `累计亏损达到上限（阈值 ${robot.stopLossQuote} U），仅允许减仓`)
+          : '仓位达到上限的 80%，进入只减仓';
         robot.lastQuoteAt = 0;
         if (!exposed) robot.cooldownUntil = now + robot.cooldownSeconds * 1000;
         this.log('critical', 'risk', robot.reason, robot, now);
       }
-      if (robot.status === 'running') this.quoteGrid(robot, market, now);
+      // 残余仓位小到挂不出 Maker 单（金额 < minNotional）时，只减仓永远无法归零 → 会永久死锁：
+      // 机器人既不挂单也不恢复，裸着仓位停在那里（实测 2026-09-14 09:51 卡在 2.4 XRP ≈ 3.36 USDC）。
+      // 这里把机器人放回网格模式。残余仓位仍然保留——不引入市价单，维持「只做 Maker、无 MARKET 入口」
+      // 的设计；但机器人不再卡死。残余量级受 minNotional/price 约束，且每轮只减仓都会重新收敛到该量级，
+      // 不会逐轮累积。
+      if (robot.status === 'reduce_only' && this.exitUnreachable(robot, market)) {
+        robot.status = 'running'; robot.reason = '残余仓位低于最小挂单规则，保留残余并回到网格';
+        robot.lastQuoteAt = 0; robot.centerPrice = '0';
+        this.log('warning', 'risk', robot.reason, robot, now);
+      }
+      if (robot.status === 'running') { if (!this.emergencyStopped) this.quoteGrid(robot, market, now); }
       else if (robot.status === 'reduce_only') this.quoteExit(robot, market, now);
     }
+  }
+
+  /**
+   * 库存偏斜：按当前持仓算出中心价应偏移多少个网格步长。
+   * 多头（持仓为正）返回正数，配合 `centerPrice.minus(step × skewSteps)` 让中心价下移，
+   * 于是卖单更贴近盘口、买单更远 —— 网格倾向减仓，自己往零库存回归。空头反之。
+   *
+   * 返回整数步长而非连续值：持仓每笔都在变，连续值会让网格每笔成交就重挂一次。
+   */
+  private inventorySkewSteps(robot: Robot, market: Market, perSide: number): number {
+    const skew = Number(robot.inventorySkew ?? 0);
+    if (!(skew > 0) || perSide <= 0) return 0;
+    const qty = D(robot.positionQty);
+    if (qty.isZero()) return 0;
+    const cap = D(robot.maxPositionNotional);
+    if (!cap.gt(0)) return 0;
+    const ratio = Decimal.min(1, positionNotional(robot, market).div(cap)).toNumber();
+    return Math.round((qty.gt(0) ? 1 : -1) * ratio * skew * perSide);
   }
 
   private quoteGrid(robot: Robot, market: Market, now: number) {
     if (now - robot.lastQuoteAt < robot.repriceSeconds * 1000) return;
     const mid = midPrice(market), center = D(robot.centerPrice);
     const half = robot.rangeMode === 'fixed' ? D(robot.halfRange) : center.mul(robot.halfRange).div(10000);
-    const recenter = center.isZero() || mid.minus(center).abs().gte(half) || now - robot.lastRecenterAt >= robot.recenterMinutes * 60000;
+    // 库存偏斜。网格原本永远以中心价对称挂单、完全不看持仓，于是价格单向运动时会持续累积
+    // 逆势仓位，最后被迫在不利价位平掉——实测平仓环节 -3.38 bps，吃掉做市收益的 82%。
+    // 这里按当前持仓把中心价往「减仓方向」偏移，让网格自己往零库存回归。
+    // 偏移按整个网格步长取整，避免持仓微动就重挂全部订单。
+    const perSide = robot.gridCount / 2;
+    const step = perSide > 0 ? half.div(perSide) : D(0);
+    const skewSteps = this.inventorySkewSteps(robot, market, perSide);
+    const skewMoved = skewSteps !== (this.lastSkew.get(robot.id) ?? 0);
+    const recenter = center.isZero() || mid.minus(center).abs().gte(half)
+      || now - robot.lastRecenterAt >= robot.recenterMinutes * 60000 || skewMoved;
     const old = this.orders.filter(o => o.robotId === robot.id);
     if (recenter && old.length) {
       if (this.budget.count(now) + old.length + 1 > this.settings.maxActionsPerMinute) {
@@ -640,13 +775,17 @@ export class MakerEngine {
     }
     if (recenter) {
       robot.centerPrice = mid.toFixed(); robot.lastRecenterAt = now;
+      this.lastSkew.set(robot.id, skewSteps);
       if (!center.isZero()) this.log('info', 'order', `移动网格中心至 ${mid.toFixed()}，原挂单先撤后重挂`, robot, now);
     }
     this.cancelOrders(o => o.robotId === robot.id && now - o.createdAt >= robot.orderTtlSeconds * 1000, now);
+    // 撤单还没在币安落地就挂新单会自成交（-5022）。跳过本轮，下一秒重试；撤单通常 <1s 完成。
+    if ((this.pendingCancels.get(robot.symbol) ?? 0) > 0) return;
     const account = this.accounts().find(a => a.asset === market.quoteAsset)!;
     let added = 0, constrained = false;
     try {
-      for (const level of gridLevels(robot, market, robot.centerPrice)) {
+      const effectiveCenter = D(robot.centerPrice).minus(step.mul(skewSteps)).toFixed();
+      for (const level of gridLevels(robot, market, effectiveCenter)) {
         if (this.orders.some(o => o.robotId === robot.id && o.side === level.side && o.price === level.price)) continue;
         const quantity = orderQuantity(robot, market, level.price, account), notional = D(quantity).mul(level.price);
         const summary = this.summary(now), currentAccount = summary.accounts.find(a => a.asset === market.quoteAsset)!;
@@ -677,10 +816,40 @@ export class MakerEngine {
     robot.lastQuoteAt = now;
   }
 
+  /**
+   * 当前持仓的浮动亏损是否超过「持仓名义额 × stopLossPercent%」。空仓返回 false。
+   *
+   * 注意这里只比「浮动亏损」，不能比「累计亏损」——累计值会随时间越滚越大，而比例阈值随
+   * 当前持仓变小，两者混用会导致仓位一小就立刻命中（实测：会话累计已实现 -3 U、持仓 14 U 时
+   * 阈值只有 0.43 U，机器人一启动就止损）。
+   * 累计失血应该由绝对阈值 stopLossQuote 去管。
+   */
+  private openStopHit(robot: Robot, market: Market, openLoss: Decimal): boolean {
+    const percent = D(robot.stopLossPercent ?? 0);
+    const notional = positionNotional(robot, market);
+    if (!percent.gt(0) || !notional.gt(0)) return false;
+    return openLoss.lte(notional.mul(percent).div(100).neg());
+  }
+
+  /** 残余仓位是否小到无法作为 Maker 单挂出——即 quoteExit 永远平不掉、会卡住的状态。 */
+  private exitUnreachable(robot: Robot, market: Market): boolean {
+    const qty = D(robot.positionQty).abs();
+    if (qty.isZero()) return false;
+    const price = D(market.markPrice);
+    if (!price.gt(0)) return false;
+    const quantity = floorStep(Decimal.min(qty, D(market.maxQty), D(robot.maxOrderNotional).div(price)), market.quantityStep);
+    return quantity.lt(market.minQty) || quantity.mul(price).lt(market.minNotional);
+  }
+
   private quoteExit(robot: Robot, market: Market, now: number) {
     if (D(robot.positionQty).isZero()) {
       this.cancelOrders(o => o.robotId === robot.id, now);
-      if (robot.reason.includes('亏损')) {
+      this.reduceSince.delete(robot.id);
+      if (this.emergencyStopped) {
+        // 全局停机期间的减仓：平完就停住，不能自动回到网格
+        robot.status = 'paused'; robot.reason = '停机减仓完成，持仓已清空；请人工复核后手动启动';
+        this.log('warning', 'robot', robot.reason, robot, now);
+      } else if (robot.reason.includes('亏损')) {
         // 因止损触发的减仓，归零后保持暂停，等人工确认，避免立刻再开仓亏损
         robot.status = 'paused'; robot.reason = '止损减仓完成，持仓已清空；请人工复核后手动启动';
         this.log('warning', 'robot', robot.reason, robot, now);
@@ -693,11 +862,21 @@ export class MakerEngine {
       return;
     }
     if (now - robot.lastQuoteAt < robot.repriceSeconds * 1000) return;
+    // 只减仓超时升级。Maker 减仓单在单边行情里可能长期无法成交：卖单必须挂在卖一或更高，
+    // 价格一路下跌时它就一直追在盘口上方，而每轮撤单重挂还会不断丢失排队位置
+    // ——实测 8 分钟 0 成交，最终裸仓无人管理 6.9 小时、亏损从 -0.6 扩大到 -5.56 U。
+    // 超过 exitTimeoutSeconds 仍未平掉就改为跨价挂单（卖挂买一 / 买挂卖一），立即成交。
+    // 这会付一次 taker 手续费，但换来「一定跑得掉」——平不掉的仓位比手续费贵得多。
+    let reduceSince = this.reduceSince.get(robot.id);
+    if (reduceSince === undefined) { reduceSince = now; this.reduceSince.set(robot.id, reduceSince); }
+    const urgent = robot.exitTimeoutSeconds > 0 && now - reduceSince >= robot.exitTimeoutSeconds * 1000;
     const side = D(robot.positionQty).gt(0) ? 'SELL' as const : 'BUY' as const;
     const offsetValue = side === 'SELL' ? robot.closeLongOffset : robot.closeShortOffset;
     const offset = robot.closeOffsetMode === 'fixed' ? D(offsetValue) : midPrice(market).mul(offsetValue).div(10000);
     const target = side === 'SELL' ? midPrice(market).plus(offset) : midPrice(market).minus(offset);
-    const price = makerPrice(side, target, market);
+    const price = urgent
+      ? (side === 'SELL' ? D(market.bid).toFixed() : D(market.ask).toFixed())
+      : makerPrice(side, target, market);
     const quantity = floorStep(Decimal.min(D(robot.positionQty).abs(), D(market.maxQty), D(robot.maxOrderNotional).div(price)), market.quantityStep);
     if (quantity.lt(market.minQty) || quantity.mul(price).lt(market.minNotional)) {
       this.cancelOrders(o => o.robotId === robot.id, now);
@@ -711,28 +890,32 @@ export class MakerEngine {
       this.notice(`${robot.id}:exit-budget`, '只减仓重报等待频率预算，原有减仓单保留', robot, now); return;
     }
     this.cancelOrders(o => o.robotId === robot.id, now);
+    // 同上：撤单未落地前挂减仓单会与旧单自成交（-5022）
+    if ((this.pendingCancels.get(robot.symbol) ?? 0) > 0) return;
     this.budget.take(1, now, this.settings.maxActionsPerMinute);
     if (this.execution === 'live' && this.liveBroker) {
-      this.placeLiveOrder(robot, side, price, quantity.toFixed(), true, now).catch(error => {
+      this.placeLiveOrder(robot, side, price, quantity.toFixed(), true, now, !urgent).catch(error => {
         this.log('warning', 'order', `实盘减仓挂单失败：${error instanceof Error ? error.message : error}`, robot, now);
       });
     } else {
       this.orders.push({ id: randomUUID(), robotId: robot.id, symbol: robot.symbol, side, price,
-        quantity: quantity.toFixed(), remaining: quantity.toFixed(), reduceOnly: true, createdAt: now, timeInForce: 'GTX', status: 'NEW' });
+        quantity: quantity.toFixed(), remaining: quantity.toFixed(), reduceOnly: true, createdAt: now,
+        timeInForce: urgent ? 'GTC' : 'GTX', status: 'NEW' });
     }
     robot.lastQuoteAt = now;
+    if (urgent) this.log('warning', 'order', `只减仓超时 ${robot.exitTimeoutSeconds}s 未平掉，改为跨价成交 @ ${price}`, robot, now);
     this.log('info', 'order', `只减仓 Maker ${side === 'SELL' ? '卖单' : '买单'} ${quantity.toFixed()} @ ${price}，等待成交`, robot, now);
   }
 
-  private async placeLiveOrder(robot: Robot, side: 'BUY' | 'SELL', price: string, quantity: string, reduceOnly: boolean, now: number): Promise<FuturesOrder> {
+  private async placeLiveOrder(robot: Robot, side: 'BUY' | 'SELL', price: string, quantity: string, reduceOnly: boolean, now: number, postOnly = true): Promise<FuturesOrder> {
     if (!this.liveBroker) throw new Error('实盘连接器未初始化');
     const clientOrderId = `pm-${robot.id.slice(0, 8)}-${randomUUID().slice(0, 8)}`;
-    // 双向持仓模式下必须以 positionSide 指定方向（LONG/SHORT），此时不能同时使用 reduceOnly。
-    const positionSide: 'LONG' | 'SHORT' = side === 'BUY' ? 'LONG' : 'SHORT';
-    // 双向持仓模式下，positionSide 已确定减仓方向；reduceOnly 仅适用于单向（BOTH）模式。
-    const withReduceOnly = reduceOnly && !positionSide;
+    // 单向持仓模式(BOTH)：一个合约只有一条腿，方向完全由 side 决定，reduceOnly 可直接用于只减仓。
+    // 单向模式下不能传 positionSide，传了币安会拒单。
+    // 本引擎的 positionQty / entryPrice / positionAfterFill 都是「单一净持仓」模型，
+    // 与单向模式一一对应；跑在对冲模式下会出现净额趋零但总敞口膨胀、止损误判等问题。
     const order = await this.liveBroker.placeLimitOrder({ symbol: robot.symbol, side, quantity, price,
-      postOnly: true, reduceOnly: withReduceOnly, positionSide, clientOrderId, workingType: 'CONTRACT_PRICE' });
+      postOnly, reduceOnly, clientOrderId, workingType: 'CONTRACT_PRICE' });
     const localId = randomUUID();
     this.orders.push({ id: localId, robotId: robot.id, symbol: robot.symbol, side, price,
       quantity, remaining: order.origQty, reduceOnly, createdAt: now, timeInForce: 'GTX',

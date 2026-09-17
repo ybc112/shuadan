@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "U 本位 Maker 移动网格模拟与风控工作台",
-  "engines": { "node": ">=22.12.0" },
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "tsx server/index.ts",
     "start": "tsx server/index.ts --production",
@@ -15,6 +17,7 @@
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
+    "compression": "^1.8.2",
     "decimal.js": "^10.6.0",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",
@@ -24,6 +27,7 @@
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@types/compression": "^1.8.1",
     "@types/express": "^5.0.0",
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.0",

@@ -198,7 +198,10 @@ export class BinancePublicFeed {
     } catch (error) {
       if (generation !== this.generation) return null;
       this.failures++;
-      this.nextPoll = Math.max(this.nextPoll, Date.now() + Math.min(60000, 5000 * 2 ** this.failures));
+      // 退避上限必须显著低于引擎的 staleAfterSeconds（默认 25s）。原来上限 60s，连续 3 次失败
+      // 就退避 40s，直接把行情拖过"过期"阈值，触发"行情断流"熔断——撤掉全部挂单并停掉机器人。
+      // 等于任何持续十几秒的网络抖动都必然导致停摆。压到 15s，保证失败期间行情龄仍低于断流阈值。
+      this.nextPoll = Math.max(this.nextPoll, Date.now() + Math.min(15000, 5000 * 2 ** this.failures));
       this.status = { status: 'error', message: `${error instanceof Error ? error.message : '行情读取失败'}`, updatedAt: this.status.updatedAt };
       return null;
     } finally { this.busy = false; }

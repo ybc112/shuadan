@@ -545,7 +545,7 @@ export class BinanceTradingClient {
       if (code === -2015 || code === -2014) throw new BinanceTradingError('AUTH_REJECTED', '账户认证未通过，请检查 Key、环境、读取权限和 IP 限制');
       if (code === -2010) throw new BinanceTradingError('BALANCE_INSUFFICIENT', '账户可用余额不足');
       if (code === -2011) throw new BinanceTradingError('ORDER_REJECTED', '订单被拒：价格、数量或参数无效');
-      if (code === -2022) throw new BinanceTradingError('LEVERAGE_INVALID', '杠杆倍数调整被拒：超出交易所允许范围');
+      if (code === -2022) throw new BinanceTradingError('ORDER_REJECTED', '订单被拒（-2022）：只减仓单会使持仓反向增加，或杠杆参数超出允许范围');
       if (code === -4046) throw new BinanceTradingError('MARGIN_TYPE_NO_CHANGE', '保证金类型无需调整');
       throw new BinanceTradingError('API_REJECTED', `币安拒绝（HTTP ${response.status}${Number.isFinite(code) && code ? `，代码 ${code}` : ''}）`);
     }

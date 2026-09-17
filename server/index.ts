@@ -1,4 +1,5 @@
 ﻿import express, { type ErrorRequestHandler } from 'express';
+import compression from 'compression';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +14,7 @@ import { BinanceReadOnlyClient, readOnlyConfigFromEnv, symbolSchema } from './bi
 import { BinanceTradingClient, tradingConfigFromEnv, type TradingConfig } from './binance-trading';
 import { ConnectionInspector } from './connection-inspector';
 import { installProxyFetch } from './proxy-fetch';
+import { TradeLog } from './trade-log';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const localEnvironment = path.join(root, '.env.local');
@@ -22,7 +24,11 @@ const port = z.coerce.number().int().min(1024).max(65535).parse(process.env.PORT
 const production = process.argv.includes('--production');
 if (production && !existsSync(path.join(root, 'dist', 'index.html'))) throw new Error('请先执行 npm run build');
 const store = new StateStore(process.env.MAKER_DATA_DIR ?? path.join(root, 'data'));
+// 成交流水的独立持久化：state.json 里的 fills 有 2000 条上限且随账户状态全量重写，
+// 这里用 SQLite 单独追加保存，可长期留存并支持运行时并发查询。
+const tradeLog = new TradeLog(process.env.MAKER_TRADES_DB ?? path.join(process.env.MAKER_DATA_DIR ?? path.join(root, 'data'), 'trades.db'));
 let engine = new MakerEngine(store.read());
+engine.attachTradeLog(tradeLog);
 if (store.recovered) engine.log('critical', 'system', '主数据文件验证失败，已从通过验证的备份恢复；所有策略暂停');
 let simulation = new SimulatedFeed();
 const binance = new BinancePublicFeed();
@@ -59,9 +65,13 @@ let shuttingDown = false;
 let persistenceFailed = false;
 let lastSaved = 0;
 let lastFeedError = '';
+let lastEquityLog = 0;
 
 const app = express();
 app.disable('x-powered-by');
+// gzip：/api/state 约 270KB、前端 JS 380KB，而这些内容（重复字段名的 JSON）压缩率极高——
+// 实测整体可压到 13%。公网链路只有约 40KB/s 时，不压缩会直接导致页面加载不出来。
+app.use(compression());
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -91,6 +101,23 @@ function save() {
     persistenceFailed = true;
     throw error;
   }
+}
+
+/** 权益快照。纯观测用途，任何失败都不能影响交易主流程。 */
+function recordEquitySnapshot(now: number) {
+  try {
+    const account = engine.liveAccount;
+    if (engine.execution !== 'live' || !account) return;
+    const robot = engine.robots[0];
+    const market = robot ? engine.markets.find(m => m.symbol === robot.symbol) : undefined;
+    tradeLog.recordEquity({
+      ts: now,
+      wallet: account.totalWalletBalance, available: account.availableBalance,
+      unrealized: account.totalUnrealizedProfit, marginUsed: account.totalPositionInitialMargin,
+      positionQty: robot?.positionQty ?? '0', markPrice: market?.markPrice ?? '0',
+      execution: engine.execution,
+    });
+  } catch { /* 快照失败忽略 */ }
 }
 
 app.get('/api/health', (_req, res) => res.json({ ok: !persistenceFailed, execution: engine.execution, version: '1.1.0', capabilities: { binanceReadOnly: true, liveTrading: tradingClient.configured, environment: tradingClient.environment, configurationIssue: tradingClient.configurationIssue } }));
@@ -135,7 +162,10 @@ app.post('/api/start-all', (_req, res) => {
 });
 app.post('/api/pause-all', (_req, res) => { engine.robots.forEach(r => engine.pauseRobot(r.id)); save(); res.json({ ok: true }); });
 app.post('/api/emergency-stop', (_req, res) => { engine.stopAll(); save(); res.json({ ok: true }); });
-app.post('/api/clear-stop', (_req, res) => { engine.clearStop(); save(); res.json({ ok: true }); });
+// rebaseline=true：操作员点击「解除停止」是显式的人工复核行为。若不重置基准，回撤锁会永久卡住
+// ——实测 2026-09-15 平掉裸头寸后权益 49.38、峰值 52.21，回撤 5.4% 一直 > 5%，机器人再也启不起来。
+// 引擎默认仍是 false（保底不放行），只有这个显式接口才重置。
+app.post('/api/clear-stop', (_req, res) => { engine.clearStop(Date.now(), true); save(); res.json({ ok: true }); });
 app.put('/api/risk', (req, res) => { engine.updateRisk(req.body); save(); res.json({ ok: true }); });
 app.get('/api/live/config', (_req, res) => {
   const saved = readLiveCredentials();
@@ -203,6 +233,7 @@ app.post('/api/reset', (req, res) => {
   z.object({ confirmation: z.literal('RESET') }).strict().parse(req.body);
   binance.reset(); simulation = new SimulatedFeed(); engine = new MakerEngine();
   engine.attachLiveBroker(tradingClient);
+  engine.attachTradeLog(tradeLog);
   engine.log('warning', 'system', '用户重置了工作台数据，恢复到空白初始状态');
   save(); res.json({ ok: true });
 });
@@ -228,6 +259,10 @@ if (!production) {
   app.use((_req, res) => res.sendFile(path.join(root, 'dist', 'index.html')));
 }
 
+// 绑定所有网卡：这是运营者的明确选择，用于从公网直接访问工作台。
+// 注意这意味着 154.89.195.153:4318 对全网开放，而 GET /api/state 无需认证即返回
+// sessionToken，任何拿到它的人都能切换实盘、用真钱下单。Host 头白名单可伪造，不构成防护。
+// 如需收紧：改回 '127.0.0.1' 配合 SSH 隧道，或在前面挂 nginx basic auth。
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`栖点 Maker 已启动：http://127.0.0.1:${port}`);
   console.log('已连接币安公开行情；未配置实盘凭据时仅展示真实数据，不做任何本地模拟。');
@@ -255,6 +290,8 @@ const interval = setInterval(() => {
     }
     engine.step(now);
     if (now - lastSaved >= 5000) save();
+    // 每分钟落一条权益快照，用于事后画资金曲线、区分网格价差收入与方向性盈亏
+    if (now - lastEquityLog >= 60000) { lastEquityLog = now; recordEquitySnapshot(now); }
   } catch (error) {
     engine.stopAll(error instanceof Error ? `内部错误：${error.message}` : '内部错误，停止报价');
     console.error(error instanceof Error ? error.message : error);
@@ -267,6 +304,7 @@ async function shutdown() {
   clearInterval(interval);
   engine.robots.forEach(r => engine.pauseRobot(r.id));
   try { save(); } catch (error) { console.error(error); }
+  tradeLog.close();
   await vite?.close();
   server.close(); store.release(); process.exit(0);
 }

@@ -180,6 +180,117 @@ test('tiny residual inventory is retained and explicitly marked as not executabl
   assert.match(robot.reason, /最小挂单/);
 });
 
+test('a robot stuck on un-closeable dust returns to the grid instead of dead-locking', () => {
+  const { engine, robot } = setup();
+  // 0.01 SOL × 100 = 1 USDC，低于 minNotional 5：作为 Maker 永远挂不出去，
+  // 而只减仓必须等仓位归零才回网格 —— 旧实现会永久卡死（既不挂单也不恢复），只能人工复位。
+  // 实测 2026-09-14 09:51 在 XRPUSDC 上卡于 2.4 XRP ≈ 3.36 USDC。
+  robot.positionQty = '0.01'; robot.entryPrice = '100';
+  robot.status = 'reduce_only'; robot.reason = '仅挂 Reduce-only 限价单，等待被动成交';
+  engine.step(T + 1000);
+  assert.equal(robot.status, 'running');
+  assert.equal(robot.positionQty, '0.01'); // 残余保留，不引入市价单，维持「只做 Maker」的设计
+});
+
+test('inventory skew pulls the grid against the position so it mean-reverts', () => {
+  const { engine, robot } = setup();
+  const MID = 100;
+  const shape = () => {
+    const buys = engine.orders.filter(o => o.side === 'BUY').map(o => Number(o.price));
+    const sells = engine.orders.filter(o => o.side === 'SELL').map(o => Number(o.price));
+    return { nearBuy: MID - Math.max(...buys), nearSell: Math.min(...sells) - MID, n: engine.orders.length };
+  };
+
+  // 基准：无持仓、inventorySkew=0 -> 买卖必须对称
+  engine.startRobot(robot.id, T);
+  const flat = shape();
+  assert.ok(flat.n > 0);
+  assert.ok(Math.abs(flat.nearBuy - flat.nearSell) < 0.02, `对称网格被破坏: ${JSON.stringify(flat)}`);
+
+  // 多头 + 开启偏斜 -> 卖单应更贴近盘口，买单更远（网格倾向减仓）
+  engine.pauseRobot(robot.id, T);
+  robot.inventorySkew = 1;
+  robot.positionQty = '10'; robot.entryPrice = '100';
+  robot.centerPrice = '0'; robot.lastRecenterAt = 0;
+  engine.startRobot(robot.id, T + 1000);
+  const skewed = shape();
+  assert.ok(skewed.nearSell < skewed.nearBuy,
+    `多头时应偏向卖出（近卖 ${skewed.nearSell} 应 < 近买 ${skewed.nearBuy}）`);
+});
+
+test('open-position stop-loss scales with position size instead of needing an unrealistic move', () => {
+  const { engine, robot } = setup();
+  // 实测问题：stopLossQuote=15 是绝对额、针对累计亏损；而单边行情亏在「当前持仓的浮亏」上，
+  // 配上 80 USDC 的仓位上限要行情走 19%~75% 才触发，一整天 0 次。
+  // 这里把绝对阈值设得很大（单独用绝不会触发），验证比例阈值能拦住浮亏。
+  robot.stopLossQuote = 80;
+  robot.stopLossPercent = 3;
+  robot.status = 'running';
+  robot.positionQty = '1'; robot.entryPrice = '103';   // 名义额 100 USDC，浮亏 3 USDC = 3%
+  engine.step(T + 1000);
+  assert.equal(robot.status, 'reduce_only');
+  assert.match(robot.reason, /浮亏达到上限/);
+
+  // 关掉比例阈值后同样浮亏不应再拦（证明拦截来自比例阈值而非绝对阈值）
+  const second = setup();
+  second.robot.stopLossQuote = 80;
+  second.robot.stopLossPercent = 0;
+  second.robot.status = 'running';
+  second.robot.positionQty = '1'; second.robot.entryPrice = '103';
+  second.engine.step(T + 1000);
+  assert.equal(second.robot.status, 'running');
+});
+
+test('emergency stop keeps the position for human review, and clearStop can explicitly rebaseline', () => {
+  const { engine, robot, market } = setup();
+  robot.positionQty = '1'; robot.entryPrice = '100';
+  engine.startRobot(robot.id, T);        // 先正常启动（此时还没超限）
+  engine.peakEquity = '30000';           // 再制造 33% 回撤，模拟持续亏损后的状态
+  engine.stopAll('测试熔断', T + 1000);
+  assert.equal(engine.emergencyStopped, true);
+  // 作者的设计：熔断保留持仓并置为 paused，交人工复核——不自动平仓，避免正好卖在浮亏低点
+  assert.equal(robot.status, 'paused');
+  assert.equal(robot.positionQty, '1');
+  // 默认调用在超限时仍然拒绝（保底不放行）
+  assert.throws(() => engine.clearStop(T + 1000), /亏损|回撤/);
+  // 人工复核后用显式 rebaseline 解除，并重置风控基准——否则回撤锁会永久卡死启不起来
+  engine.clearStop(T + 2000, true);
+  assert.equal(engine.emergencyStopped, false);
+  assert.equal(Number(engine.peakEquity), Number(engine.summary(T + 2000).equity));
+});
+
+test('a reduce-only order that cannot fill escalates to a crossing order after the timeout', () => {
+  const { engine, robot, market } = setup();
+  // 实测：Maker 减仓单在单边行情里挂不出去（卖单必须挂卖一或更高，价格一路跌就一直追在盘口上方，
+  // 撤单重挂还丢排位），8 分钟 0 成交，最终裸仓 6.9 小时亏 5.56 U。
+  robot.exitTimeoutSeconds = 60;
+  robot.status = 'reduce_only';
+  robot.positionQty = '1'; robot.entryPrice = '100';
+  robot.lastQuoteAt = 0;
+
+  engine.step(T + 1000);
+  const maker = engine.orders.find(o => o.reduceOnly);
+  assert.ok(maker, '应挂出减仓单');
+  assert.ok(Number(maker.price) >= 100.01, `未超时应挂在卖一以上（Maker），实际 ${maker.price}`);
+
+  // 推进到超时之后；同时刷新行情避免被判为断流
+  const next = move(engine, market, 100, T + 62000);
+  const crossed = engine.orders.filter(o => o.reduceOnly).at(-1);
+  assert.ok(crossed, '超时后仍应有减仓单');
+  assert.ok(Number(crossed.price) <= Number(next.bid),
+    `超时后应跨价挂在买一（立即成交），实际 ${crossed.price} 应 ≤ ${next.bid}`);
+});
+
+test('flattenOnStop makes a global stop enter reduce-only instead of leaving a naked position', () => {
+  const { engine, robot } = setup();
+  engine.settings.flattenOnStop = true;
+  robot.positionQty = '1'; robot.entryPrice = '100';
+  engine.startRobot(robot.id, T);
+  engine.stopAll('测试熔断', T + 1000);
+  assert.equal(engine.emergencyStopped, true);
+  assert.equal(robot.status, 'reduce_only', '开启 flattenOnStop 后应转入只减仓平掉持仓');
+});
+
 test('risk cancellations can exceed normal limits, which then recover after rolling 60 seconds', () => {
   const budget = new ActionBudget(); assert.equal(budget.take(10, T, 10), true); assert.equal(budget.take(1, T, 10), false);
   budget.recordCancellation(10, T + 1); assert.equal(budget.count(T + 1), 20);
