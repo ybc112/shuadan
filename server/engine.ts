@@ -227,6 +227,46 @@ export class MakerEngine {
     return robot;
   }
 
+  /**
+   * AI 指挥官/程序化热更参数：与 editRobot 不同，本方法不强制暂停，允许"运行中"机器人
+   * 撤旧单 → 合并新参数 → 立即重新 quoteGrid。若机器人当前不是 running，则只更新参数不启动。
+   * 只接受已通过 guardrail 校验的白名单字段（AI_ALLOWED_FIELDS），完整参数变更请走 editRobot。
+   */
+  // robotSchema 被 .strict().superRefine() 包装成 ZodEffects，不再暴露 .shape，
+  // 因此这里用显式的 RobotConfig 字段清单来挑选可校验字段做合并。
+  private static readonly CONFIG_FIELDS = ['name', 'symbol', 'sizingMode', 'orderSize', 'contractSize', 'gridCount', 'rangeMode', 'halfRange', 'recenterMinutes', 'repriceSeconds', 'orderTtlSeconds', 'closeOffsetMode', 'closeLongOffset', 'closeShortOffset', 'leverage', 'maxPositionNotional', 'maxOpenNotional', 'maxOrderNotional', 'stopLossQuote', 'stopLossPercent', 'shockPercent', 'cooldownSeconds', 'makerFeeBps', 'inventorySkew', 'exitTimeoutSeconds'];
+
+  applyLiveParams(id: string, partial: Partial<RobotConfig>, now = Date.now()) {
+    const robot = this.robot(id);
+    // 只挑选 RobotConfig 字段做合并与校验，避免运行时字段（id/status/positionQty 等）触发 strict 拒绝。
+    const candidate: Record<string, unknown> = {};
+    for (const key of MakerEngine.CONFIG_FIELDS) {
+      const value = (partial as unknown as Record<string, unknown>)[key] ?? (robot as unknown as Record<string, unknown>)[key];
+      candidate[key] = value;
+    }
+    candidate.symbol = robot.symbol;
+    const config = robotSchema.parse(candidate);
+    this.preview(config);
+    const wasRunning = robot.status === 'running';
+    // 参数可能影响挂单密度/间距，先撤旧单再按新参数重挂
+    this.cancelOrders(o => o.robotId === id, now);
+    Object.assign(robot, config, { lastQuoteAt: 0 });
+    this.log('info', 'ai', `AI 热更参数 ${robot.symbol}: ${JSON.stringify(partial)}`, robot, now);
+    if (!wasRunning) {
+      robot.reason = '参数已更新（AI），机器人保持暂停';
+      return robot;
+    }
+    const market = this.markets.find(m => m.symbol === robot.symbol);
+    if (this.fresh(market, now)) {
+      robot.reason = 'Maker 双向挂单（AI 热更后），风控监测中';
+      this.quoteGrid(robot, market, now);
+    } else {
+      robot.status = 'running';
+      robot.reason = '行情暂不可用，AI 热更后待下一轮出价';
+    }
+    return robot;
+  }
+
   deleteRobot(id: string, now = Date.now()) {
     const robot = this.robot(id);
     if (!D(robot.positionQty).isZero()) throw new Error('机器人仍有持仓，不能删除；请先只减仓并等待成交');

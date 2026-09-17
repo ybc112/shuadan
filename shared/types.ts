@@ -120,7 +120,7 @@ export interface AuditEvent {
   id: string;
   time: number;
   level: 'info' | 'warning' | 'critical';
-  category: 'system' | 'order' | 'risk' | 'robot' | 'live';
+  category: 'system' | 'order' | 'risk' | 'robot' | 'live' | 'ai';
   message: string;
   robotId?: string;
   symbol?: string;

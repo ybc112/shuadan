@@ -1,4 +1,4 @@
-﻿import express, { type ErrorRequestHandler } from 'express';
+import express, { type ErrorRequestHandler } from 'express';
 import compression from 'compression';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
@@ -15,6 +15,11 @@ import { BinanceTradingClient, tradingConfigFromEnv, type TradingConfig } from '
 import { ConnectionInspector } from './connection-inspector';
 import { installProxyFetch } from './proxy-fetch';
 import { TradeLog } from './trade-log';
+import { KlineCollector, makeBinanceKlinesFetcher } from './klines';
+import { NewsCollector, makeBinanceNewsFetcher } from './info-news';
+import { LlmClient } from './llm-client';
+import { makeSearchClient } from './web-search';
+import { AiRunner } from './ai-runner';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const localEnvironment = path.join(root, '.env.local');
@@ -60,6 +65,27 @@ let tradingClient: BinanceTradingClient;
   tradingClient = new BinanceTradingClient(loaded.config);
 }
 engine.attachLiveBroker(tradingClient);
+
+// ===== AI 策略指挥官（量化决策层）=====
+// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
+// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
+const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
+const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
+const aiNews = new NewsCollector(makeBinanceNewsFetcher());
+const aiSearch = makeSearchClient(process.env);
+const aiLlm = LlmClient.fromEnv(process.env);
+const aiRunner = new AiRunner({
+  engine,
+  klines: aiKlines,
+  news: aiNews,
+  llm: aiLlm,
+  search: aiSearch,
+  dataDir: aiDataDir,
+  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
+  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
+  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
+  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+});
 const sessionToken = randomBytes(32).toString('hex');
 let shuttingDown = false;
 let persistenceFailed = false;
@@ -123,6 +149,7 @@ function recordEquitySnapshot(now: number) {
 app.get('/api/health', (_req, res) => res.json({ ok: !persistenceFailed, execution: engine.execution, version: '1.1.0', capabilities: { binanceReadOnly: true, liveTrading: tradingClient.configured, environment: tradingClient.environment, configurationIssue: tradingClient.configurationIssue } }));
 app.get('/api/state', (_req, res) => res.json({ ...engine.snapshot(), sessionToken }));
 app.get('/api/binance/status', (_req, res) => res.json(inspector.status()));
+app.get('/api/ai/status', (_req, res) => res.json({ ...aiRunner.status, recent: aiRunner.recentHistory(20) }));
 app.post('/api/binance/check', (req, res) => {
   const input = z.object({ symbol: symbolSchema.default('BTCUSDT'), includeAccount: z.boolean().default(false) }).strict().parse(req.body);
   res.status(202).json(inspector.start(input.symbol, input.includeAccount));
@@ -184,6 +211,27 @@ app.post('/api/live/config', (req, res) => {
   liveCredentialsSource = 'file';
   tradingClient.configure(effective);
   engine.attachLiveBroker(tradingClient);
+
+// ===== AI 策略指挥官（量化决策层）=====
+// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
+// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
+const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
+const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
+const aiNews = new NewsCollector(makeBinanceNewsFetcher());
+const aiSearch = makeSearchClient(process.env);
+const aiLlm = LlmClient.fromEnv(process.env);
+const aiRunner = new AiRunner({
+  engine,
+  klines: aiKlines,
+  news: aiNews,
+  llm: aiLlm,
+  search: aiSearch,
+  dataDir: aiDataDir,
+  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
+  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
+  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
+  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+});
   res.json({ ok: true, configured: tradingClient.configured, configurationIssue: tradingClient.configurationIssue,
     environment: tradingClient.environment, keyTail: tradingClient.apiKeyTail(), source: 'file' });
 });
@@ -194,6 +242,27 @@ app.post('/api/live/config/clear', (_req, res) => {
   const fallback: TradingConfig = fromEnv.apiKey && fromEnv.apiSecret ? fromEnv : { environment: 'demo' };
   tradingClient.configure(fallback);
   engine.attachLiveBroker(tradingClient);
+
+// ===== AI 策略指挥官（量化决策层）=====
+// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
+// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
+const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
+const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
+const aiNews = new NewsCollector(makeBinanceNewsFetcher());
+const aiSearch = makeSearchClient(process.env);
+const aiLlm = LlmClient.fromEnv(process.env);
+const aiRunner = new AiRunner({
+  engine,
+  klines: aiKlines,
+  news: aiNews,
+  llm: aiLlm,
+  search: aiSearch,
+  dataDir: aiDataDir,
+  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
+  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
+  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
+  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+});
   liveCredentialsSource = fromEnv.apiKey && fromEnv.apiSecret ? 'env' : 'none';
   res.json({ ok: true, configured: tradingClient.configured });
 });
@@ -233,6 +302,27 @@ app.post('/api/reset', (req, res) => {
   z.object({ confirmation: z.literal('RESET') }).strict().parse(req.body);
   binance.reset(); simulation = new SimulatedFeed(); engine = new MakerEngine();
   engine.attachLiveBroker(tradingClient);
+
+// ===== AI 策略指挥官（量化决策层）=====
+// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
+// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
+const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
+const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
+const aiNews = new NewsCollector(makeBinanceNewsFetcher());
+const aiSearch = makeSearchClient(process.env);
+const aiLlm = LlmClient.fromEnv(process.env);
+const aiRunner = new AiRunner({
+  engine,
+  klines: aiKlines,
+  news: aiNews,
+  llm: aiLlm,
+  search: aiSearch,
+  dataDir: aiDataDir,
+  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
+  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
+  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
+  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+});
   engine.attachTradeLog(tradeLog);
   engine.log('warning', 'system', '用户重置了工作台数据，恢复到空白初始状态');
   save(); res.json({ ok: true });
@@ -268,6 +358,8 @@ const server = app.listen(port, '0.0.0.0', () => {
   console.log('已连接币安公开行情；未配置实盘凭据时仅展示真实数据，不做任何本地模拟。');
   console.log(`实盘交易：${tradingClient.configured ? '凭据已就绪（' + (liveCredentialsSource === 'env' ? '.env' : liveCredentialsSource === 'file' ? '页面保存' : '未知') + '），可在使用指南中切换到 ' + tradingClient.environment : '尚未配置实盘凭据，可在使用指南页面填写'}`);
 });
+aiRunner.start();
+
 server.on('error', error => { console.error(error.message); store.release(); process.exit(1); });
 
 const interval = setInterval(() => {

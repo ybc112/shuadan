@@ -8,3 +8,5 @@ work/
 output/
 *.log
 .playwright-cli/
+
+.trae/

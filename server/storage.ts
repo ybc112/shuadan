@@ -1,4 +1,4 @@
-﻿import { existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, closeSync, fsyncSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, closeSync, fsyncSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { robotSchema, riskSchema } from '../shared/config';
@@ -56,7 +56,7 @@ const schema = z.object({
     realizedPnl: decimal, time, liquidity: z.enum(['MAKER', 'TAKER']),
     execution: z.enum(['SIMULATED', 'LIVE']), tradeId: z.string().optional() })).max(2000),
   events: z.array(z.object({ id: z.string(), time, level: z.enum(['info', 'warning', 'critical']),
-    category: z.enum(['system', 'order', 'risk', 'robot', 'live']),
+    category: z.enum(['system', 'order', 'risk', 'robot', 'live', 'ai']),
     message: z.string(), robotId: z.string().optional(), symbol: z.string().optional() })).max(600),
   settings: riskSchema, emergencyStopped: z.boolean(), stopReason: z.string(), day: z.string(),
   dailyStartEquity: decimal, peakEquity: decimal, totalFees: decimal, totalFilledNotional: nonnegative,
