@@ -10,7 +10,7 @@
 import { z } from 'zod';
 
 export type KlineInterval =
-  | '5m' | '15m' | '30m' | '1h' | '2h' | '4h' | '1d';
+  | '1m' | '5m' | '15m' | '30m' | '1h' | '2h' | '4h' | '1d';
 
 export const KLINE_INTERVALS: KlineInterval[] = ['5m', '30m', '2h', '1d'];
 

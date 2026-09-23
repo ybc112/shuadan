@@ -83,7 +83,7 @@ const accountSchema = z.object({
 const positionSchema = z.object({
   symbol: z.string(), positionSide: positionSideSchema, positionAmt: decimalString,
   entryPrice: decimalString, markPrice: decimalString, unRealizedProfit: decimalString.optional(),
-  liquidationPrice: decimalString, leverage: decimalString, marginType: z.string().optional(),
+  liquidationPrice: decimalString, leverage: decimalString.optional(), marginType: z.string().optional(),
 });
 
 const orderSideSchema = z.enum(['BUY', 'SELL']);
@@ -312,7 +312,7 @@ export class BinanceTradingClient {
     return z.array(positionSchema).parse(data).map(p => ({
       symbol: p.symbol, positionSide: p.positionSide, positionAmt: p.positionAmt,
       entryPrice: p.entryPrice, markPrice: p.markPrice, unRealizedProfit: p.unRealizedProfit ?? '0',
-      liquidationPrice: p.liquidationPrice, leverage: p.leverage, marginType: p.marginType ?? 'CROSSED',
+      liquidationPrice: p.liquidationPrice, leverage: p.leverage ?? '1', marginType: p.marginType ?? 'CROSSED',
     }));
   }
 

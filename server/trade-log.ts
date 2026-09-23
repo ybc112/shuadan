@@ -110,6 +110,41 @@ export class TradeLog {
     return { trades: t.n, snapshots: s.n, file: this.file };
   }
 
+  /** 最近 N 笔成交（升序/倒序），供图表与报表使用。 */
+  recentTrades(limit = 200, descending = true): TradeRecord[] {
+    const rows = this.#db.prepare(
+      `SELECT symbol, side, price, quantity, fee, realized_pnl, trade_time
+       FROM trades ORDER BY trade_time ${descending ? 'DESC' : 'ASC'} LIMIT ?`,
+    ).all(limit) as { symbol: string; side: 'BUY' | 'SELL'; price: string; quantity: string; fee: string; realized_pnl: string; trade_time: number }[];
+    return rows.map(r => ({ id: String(r.trade_time), orderId: '', robotId: '', symbol: r.symbol,
+      side: r.side, price: r.price, quantity: r.quantity, fee: r.fee ?? '0', realizedPnl: r.realized_pnl ?? '0',
+      time: r.trade_time, liquidity: 'MAKER', execution: 'LIVE' }));
+  }
+
+  /** 按符号聚合成交：返回逐笔成交序列，供前端画买卖成交 + 累计收益图。 */
+  symbolSeries(symbol: string, from: number): Array<{
+    ts: number; price: number; buyQty: number; sellQty: number; buyCount: number; sellCount: number;
+    realizedPnl: number; fee: number;
+  }> {
+    const rows = this.#db.prepare(
+      `SELECT side, price, quote_qty, fee, realized_pnl, trade_time
+       FROM trades WHERE symbol = ? AND trade_time >= ? ORDER BY trade_time ASC`,
+    ).all(symbol, from) as { side: 'BUY' | 'SELL'; price: string; quote_qty: string; fee: string; realized_pnl: string; trade_time: number }[];
+    return rows.map(r => ({ ts: r.trade_time, price: Number(r.price),
+      buyQty: r.side === 'BUY' ? Number(r.quote_qty) : 0, sellQty: r.side === 'SELL' ? Number(r.quote_qty) : 0,
+      buyCount: r.side === 'BUY' ? 1 : 0, sellCount: r.side === 'SELL' ? 1 : 0,
+      realizedPnl: Number(r.realized_pnl ?? 0), fee: Number(r.fee ?? 0) }));
+  }
+
+  /** 权益曲线（分钟级快照），供画累计收益 K 线/面积图。 */
+  equitySeries(from: number): Array<{ ts: number; wallet: number; unrealized: number; marginUsed: number; markPrice: number }> {
+    const rows = this.#db.prepare(
+      `SELECT ts, wallet, unrealized, margin_used, mark_price FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC`,
+    ).all(from) as { ts: number; wallet: string; unrealized: string; margin_used: string; mark_price: string }[];
+    return rows.map(r => ({ ts: r.ts, wallet: Number(r.wallet), unrealized: Number(r.unrealized ?? 0),
+      marginUsed: Number(r.margin_used ?? 0), markPrice: Number(r.mark_price ?? 0) }));
+  }
+
   close(): void {
     if (this.#closed) return;
     this.#closed = true;

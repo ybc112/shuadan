@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   font-family: "Segoe UI", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
   color: #e7ebed; background: #101417; font-synthesis: none; text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased; --bg: #101417; --panel: #171d21; --panel-2: #1c2328;
@@ -152,6 +152,43 @@ nav { display: flex; flex-direction: column; gap: 7px; }
 .chart-bottom span { display: inline-flex; align-items: center; gap: 5px; font-size: 8px; color: #84958e; white-space: nowrap; }
 .chart-bottom small { font-size: 8px; color: #596b74; margin-left: auto; }
 .legend-line { width: 13px; height: 2px; background: #bbe68e; }.legend-dash { width: 13px; height: 1px; border-top: 1px dashed #79b198; }.legend-dash.red { border-color: #c2878b; }
+.analytics-panel { margin-bottom: 20px; }
+.analytics-panel .panel-heading { padding-bottom: 13px; }
+.analytics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+.analytics-grid > .analytics-card + .analytics-card { border-left: 1px solid #263036; }
+.analytics-card { padding: 5px 18px 13px; min-width: 0; }
+.analytics-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 3px 10px; }
+.analytics-head > div:first-child strong { display: block; font-size: 12px; font-weight: 600; color: #d6e0d9; letter-spacing: -.2px; }
+.analytics-head > div:first-child span { font-size: 8px; color: #6f838c; margin-top: 4px; display: block; }
+.analytics-stats { display: flex; gap: 12px; font-size: 9px; white-space: nowrap; }
+.analytics-stats span { font-variant-numeric: tabular-nums; }
+.analytics-chart { position: relative; min-height: 120px; }
+.analytics-chart > svg { width: 100%; display: block; }
+.analytics-foot { display: flex; align-items: center; gap: 16px; padding: 10px 3px 0; border-top: 1px solid #263036; margin-top: 8px; }
+.analytics-foot span { display: inline-flex; align-items: center; gap: 5px; font-size: 8px; color: #84958e; white-space: nowrap; }
+.analytics-foot small { font-size: 8px; color: #596b74; margin-left: auto; }
+.analytics-foot .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.analytics-foot .dot.buy { background: #7ddb9c; }.analytics-foot .dot.sell { background: #e58b96; }
+.analytics-foot .line { width: 14px; height: 2px; display: inline-block; border-radius: 1px; }
+.analytics-foot .line.blue { background: #9cc7e8; }.analytics-foot .line.amber { background: #e7b46f; }
+.trend-panel { margin-bottom: 20px; }
+.trend-top { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; padding: 0 21px 16px; }
+.trend-kpi { background: #1a2327; border: 1px solid #2b373d; border-radius: 8px; padding: 12px 14px; }
+.trend-kpi span { font-size: 8px; color: #72868f; display: block; }
+.trend-kpi strong { display: block; font-size: 18px; font-weight: 500; color: #e2ebe4; margin-top: 5px; }
+.trend-kpi strong.positive { color: #9adfae; }
+.trend-kpi small { font-size: 8px; color: #657981; margin-top: 4px; display: block; }
+.trend-kpi.error { border-color: #7a4a4a; }.trend-kpi.error strong { color: #df7d84; font-size: 11px; line-height: 1.5; }
+.trend-settings { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; padding: 0 21px 18px; border-top: 1px solid #263036; padding-top: 16px; }
+.trend-settings-title { display: flex; align-items: center; gap: 7px; color: #a7b8ae; font-size: 11px; font-weight: 600; width: 100%; margin-bottom: 2px; }
+.trend-settings .field-block { flex: 1; min-width: 120px; }
+.trend-settings .field-block + .field-block { margin: 0; }
+.trend-settings > button { align-self: flex-end; }
+.trend-field { display: flex; flex-direction: column; gap: 6px; }
+.trend-field label { font-size: 8px; color: #72868f; }
+.trend-field select { background: #161e23; color: #e3e8eb; border: 1px solid #303c43; border-radius: 5px; padding: 7px 9px; font-size: 11px; }
+.trend-field .toggle { width: 52px; height: 26px; border-radius: 999px; border: 1px solid #3a4850; background: #222c31; color: #7d8f98; font-size: 10px; cursor: pointer; transition: all .12s; }
+.trend-field .toggle.on { background: #3d5245; border-color: #5d7f68; color: #b9e6c4; }
 .risk-overview { display: flex; flex-direction: column; }
 .risk-state { display: flex; align-items: center; gap: 5px; color: #a5bc92; font-size: 9px; }.risk-state i { width: 4px; height: 4px; border-radius: 50%; background: #abc48e; }.risk-state.attention { color: var(--amber); }.risk-state.attention i { background: var(--amber); }
 .risk-gauge { position: relative; width: 135px; height: 135px; margin: -3px auto 0; }

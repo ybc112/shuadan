@@ -1,23 +1,24 @@
-﻿import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, ArrowDownLeft, ArrowDownToLine, ArrowRight, ArrowUpRight, Bell, BookOpen, Bot, Check, CheckCheck, ChevronDown, ChevronRight, CircleAlert, CircleHelp, CircleStop, Clock3, Download, FileClock, Globe2, Grid2X2, Layers3, LayoutDashboard, LoaderCircle, Menu, Pause, Play, Plus, Radio, RefreshCw, Search, Shield, ShieldCheck, SlidersHorizontal, Trash2, TrendingDown, TrendingUp, Wallet, Waves, Wifi, WifiOff, X, Zap } from 'lucide-react';
 import type { AppState, AuditEvent, Market, QuoteAsset, RiskSettings, Robot, RobotConfig } from '../shared/types';
 import { SIZING_LABELS } from '../shared/types';
 import { defaultConfig, riskSchema } from '../shared/config';
 import { api, setToken } from './api';
-import { CoinIcon, Empty, External, Modal, PanelHeading, PriceChart, Sparkline, Status, compact, money, price, shortDate, signed, time } from './components';
+import { CoinIcon, Empty, External, Modal, PanelHeading, PriceChart, Sparkline, Status, TradeAnalytics, compact, money, price, shortDate, signed, time, type EquityPoint, type TradePoint } from './components';
 import { Numeric, RobotForm } from './RobotForm';
 import BinanceConnection from './BinanceConnection';
 
-type Page = 'overview' | 'robots' | 'markets' | 'risk' | 'logs' | 'guide';
+type Page = 'overview' | 'trend' | 'robots' | 'markets' | 'risk' | 'logs' | 'guide';
 type Command = (path: string, method?: string, body?: unknown, success?: string) => Promise<any>;
 const navigation: { id: Page; name: string; icon: typeof Bot }[] = [
   { id: 'overview', name: '工作台总览', icon: LayoutDashboard },
+  { id: 'trend', name: '趋势追踪', icon: TrendingUp },
   { id: 'robots', name: '我的机器人', icon: Bot },
-  { id: 'markets', name: '市场榜单', icon: TrendingUp },
+  { id: 'markets', name: '市场榜单', icon: Grid2X2 },
   { id: 'risk', name: '风控中心', icon: ShieldCheck },
   { id: 'logs', name: '运行日志', icon: FileClock },
 ];
-const pageNames: Record<Page, string> = { overview: '工作台总览', robots: '我的机器人', markets: '市场榜单', risk: '风控中心', logs: '运行日志', guide: '使用指南与设置' };
+const pageNames: Record<Page, string> = { overview: '工作台总览', trend: '趋势追踪', robots: '我的机器人', markets: '市场榜单', risk: '风控中心', logs: '运行日志', guide: '使用指南与设置' };
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
@@ -32,6 +33,9 @@ export default function App() {
   const [confirmText, setConfirmText] = useState('');
   const [chartSymbol, setChartSymbol] = useState('BTCUSDC');
   const [chartSeconds, setChartSeconds] = useState(180);
+  const [analytics, setAnalytics] = useState<{ trades: TradePoint[]; equity: EquityPoint[]; bySymbol: Record<string, { count: number; fee: number; realizedPnl: number }> | null } | null>(null);
+  const [analyticsSymbol, setAnalyticsSymbol] = useState('XRPUSDC');
+  const [analyticsHours, setAnalyticsHours] = useState(24);
   const sequence = useRef(0);
   const active = useRef(true);
 
@@ -42,6 +46,20 @@ export default function App() {
       if (active.current && seq === sequence.current) { setToken(next.sessionToken ?? ''); setState(next); setConnectionError(''); }
     } catch (error) { if (active.current && seq === sequence.current) setConnectionError(error instanceof Error ? error.message : '服务连接中断'); }
   }, []);
+  // 成交/收益分析数据，独立于 3 秒状态轮询，5 秒刷新一次足够（来源于 trades.db）
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const data = await api<{ trades: TradePoint[]; equity: EquityPoint[]; bySymbol: Record<string, { count: number; fee: number; realizedPnl: number }> }>(`/analytics?hours=${analyticsHours}&symbol=${analyticsSymbol}`);
+        if (alive) setAnalytics(data);
+      } catch { /* 分析数据失败不阻塞主界面 */ }
+    };
+    if (page === 'overview') { void load(); const timer = setInterval(() => void load(), 5000); return () => { alive = false; clearInterval(timer); }; }
+    return; // eslint-disable-line consistent-return
+  }, [page, analyticsSymbol, analyticsHours]);
+  // 分析下拉框同步有机器人的交易对
+  useEffect(() => { if (state?.robots[0]) setAnalyticsSymbol(state.robots[0].symbol); }, [state?.robots[0]?.symbol]);
   // 轮询间隔。原来是 1500ms，但 /api/state 单次响应约 270KB：在只有 ~40KB/s 的公网链路上，
   // 1.5 秒轮询的带宽需求是 358KB/s，请求永远追不上，页面会永久停在"正在载入"。
   // 改成 3 秒后需求减半，配合服务端 gzip 才降到链路能力以内。
@@ -116,7 +134,7 @@ export default function App() {
         {connectionError && <div className="alert-banner danger" role="alert"><WifiOff size={18} /><div><strong>本地服务连接中断</strong><span>页面为最后一次快照，不能据此判断撤单是否完成。请恢复服务连接。</span></div><button className="button secondary small" onClick={() => void refresh()}>重试</button></div>}
         {state.emergencyStopped && <div className="alert-banner danger" role="alert"><CircleStop size={20} /><div><strong>全局停止已生效 · {state.stopReason}</strong><span>所有挂单已撤销，持仓仍保留。解除停止后，机器人保持暂停。</span></div><button className="button danger-ghost small" onClick={() => void command('/clear-stop', 'POST', undefined, '停止锁已解除，需手动启动机器人')} disabled={busy}>解除停止</button></div>}
         {!connectionError && state.feed.status !== 'connected' && <div className="alert-banner warning" role="status"><WifiOff size={18} /><div><strong>行情连接{state.feed.status === 'connecting' ? '中' : '异常'}</strong><span>{state.feed.message}</span></div><button className="text-button" onClick={() => go('guide')}>查看设置<ArrowRight size={14} /></button></div>}
-        <div className="page-heading"><div><div className="eyebrow">{page === 'overview' ? 'YOUR STRATEGY, IN VIEW' : page === 'risk' ? 'RISK BEFORE RETURN' : 'PERCH · MAKER WORKSPACE'}</div><h1>{page === 'overview' ? '合约工作台' : pageNames[page]}{page === 'overview' && <span className="heading-tag">U 本位永续</span>}</h1><p>{page === 'overview' ? '有序挂单，从容应对每一次市场变化。' : page === 'robots' ? '每个币种独立配置，每一笔订单都有边界。' : page === 'markets' ? '按 24 小时报价币成交额筛选，独立创建策略。' : page === 'risk' ? '把仓位、资金与极端行情放在同一张风险地图里。' : page === 'logs' ? '查看每次报价、状态变更和风险触发的记录。' : '了解配置、挂单与风控如何配合工作。'}</p></div>
+        <div className="page-heading"><div><div className="eyebrow">{page === 'overview' ? 'YOUR STRATEGY, IN VIEW' : page === 'trend' ? 'MOMENTUM LEADERBOARD' : page === 'risk' ? 'RISK BEFORE RETURN' : 'PERCH · MAKER WORKSPACE'}</div><h1>{page === 'overview' ? '合约工作台' : pageNames[page]}{page === 'overview' && <span className="heading-tag">U 本位永续</span>}</h1><p>{page === 'overview' ? '有序挂单，从容应对每一次市场变化。' : page === 'trend' ? '只做涨跌幅榜单里的强势币，跟随超趋势方向。' : page === 'robots' ? '每个币种独立配置，每一笔订单都有边界。' : page === 'markets' ? '按 24 小时报价币成交额筛选，独立创建策略。' : page === 'risk' ? '把仓位、资金与极端行情放在同一张风险地图里。' : page === 'logs' ? '查看每次报价、状态变更和风险触发的记录。' : '了解配置、挂单与风控如何配合工作。'}</p></div>
           <div className="heading-actions">{(page === 'overview' || page === 'robots') && <><button className="button secondary" onClick={() => state.summary.runningCount ? void command('/pause-all', 'POST', undefined, '全部机器人已暂停，挂单已撤销，持仓保留') : void startAll()} disabled={busy || !fresh || state.emergencyStopped}>{state.summary.runningCount ? <Pause size={15} /> : <Play size={15} />}{state.summary.runningCount ? '全部暂停' : '启动'}</button><button className="button primary" onClick={() => create()} disabled={!canCreate}><Plus size={17} />创建机器人</button></>}{page === 'logs' && <a className="button secondary" href="/api/export" download><Download size={16} />导出记录</a>}</div>
         </div>
 
@@ -126,9 +144,13 @@ export default function App() {
           <div className="overview-grid"><section className="panel market-panel"><PanelHeading title="市场与挂单"><div className="chart-controls"><select aria-label="图表交易合约" value={market?.symbol ?? ''} onChange={e => setChartSymbol(e.target.value)}>{state.markets.slice().sort((a, b) => b.quoteVolume - a.quoteVolume).map(m => <option key={m.symbol} value={m.symbol}>{m.symbol}</option>)}</select><div className="mini-segment"><button className={chartSeconds === 60 ? 'selected' : ''} onClick={() => setChartSeconds(60)}>1 分</button><button className={chartSeconds === 180 ? 'selected' : ''} onClick={() => setChartSeconds(180)}>3 分</button></div></div></PanelHeading>
             {market ? <><div className="chart-market-info"><CoinIcon base={market.baseAsset} /><div><strong>{market.baseAsset}<span> / {market.quoteAsset}</span></strong><small>永续合约 · 标记价格</small></div><div className="market-price"><strong>{price(market.markPrice)}</strong><span className={market.changePercent >= 0 ? 'positive' : 'negative'}>{signed(market.changePercent)}% <small>24h</small></span></div></div><PriceChart market={market} orders={state.orders.filter(o => o.symbol === market.symbol)} seconds={chartSeconds} /><div className="chart-bottom"><span><i className="legend-line" />标记价格</span><span><i className="legend-dash green" />最近买单</span><span><i className="legend-dash red" />最近卖单</span><small>{'币安公开行情'} · {time(market.updatedAt)}</small></div></> : <Empty title="等待行情连接" detail="连接成功后展示价格与挂单位置" />}
           </section><RiskOverview state={state} onOpen={() => go('risk')} /></div>
+          <section className="panel analytics-panel"><PanelHeading title="买卖成交与收益" description="来自币安成交流水与权益快照（trades.db）"><div className="chart-controls"><select aria-label="分析交易对" value={analyticsSymbol} onChange={e => setAnalyticsSymbol(e.target.value)}>{state.robots.length ? state.robots.map(r => <option key={r.symbol} value={r.symbol}>{r.symbol}</option>) : <option value="">——</option>}</select><div className="mini-segment">{([4, 24, 168] as const).map(h => <button key={h} className={analyticsHours === h ? 'selected' : ''} onClick={() => setAnalyticsHours(h)}>{h === 168 ? '7 天' : `${h} 时`}</button>)}</div></div></PanelHeading>
+            {analytics ? <TradeAnalytics trades={analytics.trades} equity={analytics.equity} symbol={analyticsSymbol} hours={analyticsHours} /> : <Empty title="正在加载历史数据" detail="从 SQLite 成交账本读取图表数据" />}
+          </section>
           <RobotTable state={state} onDetail={r => setDetailId(r.id)} onEdit={edit} onAction={robotAction} onCreate={() => create()} busy={busy || !fresh} />
           <div className="activity-footer"><span><CheckCheck size={15} />{state.events[0]?.message ?? '工作台已就绪'}</span><button className="text-button" onClick={() => go('logs')}>查看日志<ArrowRight size={14} /></button></div>
         </>}
+        {page === 'trend' && <TrendPage command={command} busy={busy} />}
         {page === 'robots' && <><div className="robot-summary"><span><Bot size={18} /><b>{state.robots.length}</b> 个机器人</span><span><i className="dot green" /><b>{state.summary.runningCount}</b> 个运行中</span><span><i className="dot amber" /><b>{state.robots.filter(r => r.status === 'cooldown').length}</b> 个熔断</span><span><Layers3 size={16} /><b>{state.orders.length}</b> 笔挂单</span></div><RobotTable state={state} onDetail={r => setDetailId(r.id)} onEdit={edit} onAction={robotAction} onCreate={() => create()} busy={busy || !fresh} full /></>}
         {page === 'markets' && <MarketPage state={state} onCreate={create} onDetail={r => setDetailId(r.id)} onBatch={batchCreate} busy={busy || !fresh} />}
         {page === 'risk' && <RiskPage state={state} command={command} busy={busy} />}
@@ -328,4 +350,62 @@ function RobotDetail({ robot, state, onClose, onEdit, onDelete, onAction, busy }
         ['每格方式', SIZING_LABELS[robot.sizingMode]], ['每格下单量', `${robot.orderSize}${robot.sizingMode.endsWith('_pct') ? '%' : robot.sizingMode === 'quote' ? ' U' : robot.sizingMode === 'contracts' ? ` 张（每张 ${robot.contractSize} 币）` : ' 币'}`], ['网格 / 半区间', `${robot.gridCount} 格 / ±${robot.halfRange} ${robot.rangeMode === 'fixed' ? 'U' : 'bps'}`], ['移动网格中心', `每 ${robot.recenterMinutes} 分钟 / 突破区间`], ['报价最小间隔 / 有效期', `${robot.repriceSeconds} 秒 / ${robot.orderTtlSeconds} 秒`], ['平多 / 平空偏移', `${robot.closeLongOffset} / ${robot.closeShortOffset} ${robot.closeOffsetMode === 'fixed' ? 'U' : 'bps'}`], ['持仓 / 开仓挂单上限', `${robot.maxPositionNotional} / ${robot.maxOpenNotional} U`], ['单笔上限', `${robot.maxOrderNotional} U`], ['累计净亏损上限', `${robot.stopLossQuote} U`], ['10 秒波动熔断', `${robot.shockPercent}%`], ['冷却时间', `${robot.cooldownSeconds} 秒，手动恢复`], ['创建时间', shortDate(robot.createdAt)],
       ].map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>}
     </div><div className="drawer-footer"><span><Shield size={13} />暂停或撤单不会平仓</span><button className="text-button negative" onClick={onDelete} disabled={hasPosition}><Trash2 size={14} />删除机器人</button></div></Modal>;
+}
+
+function TrendPage({ command, busy }: { command: Command; busy: boolean }) {
+  const [state, setState] = useState<{
+    enabled: boolean; config: { topCount: number; tickSeconds: number; orderNotional: number; atrWindow: number; atrMultiplier: number; interval: string; quoteAssets: string[]; minQuoteVolume: number; longOnly: boolean; maxChasePct: number; stopLossPct: number };
+    lastCycleAt: number; cycleCount: number; lastError: string;
+    positions: Array<{ symbol: string; side: string; qty: number; entryPrice: number; openedAt: number }>;
+    lastRanking: Array<{ symbol: string; changePct: number; volume: number; direction: number | string; reason: string }>;
+    events: Array<{ time: number; message: string; level: string }>;
+  } | null>(null);
+  const [form, setForm] = useState({ topCount: 3, tickSeconds: 60, orderNotional: 1, atrWindow: 3, atrMultiplier: 1.5, interval: '1m', quoteAssets: ['USDT'], minQuoteVolume: 1000000, longOnly: true, maxChasePct: 30, stopLossPct: 5 });
+
+  const load = useCallback(async () => {
+    try { setState(await api('/momentum/status')); } catch { /* 趋势引擎接口失败不阻塞 */ }
+  }, []);
+  useEffect(() => { void load(); const timer = setInterval(() => void load(), 5000); return () => clearInterval(timer); }, [load]);
+  // 状态同步到表单（仅首次）
+  useEffect(() => {
+    if (state && form.topCount === 3 && state.config.topCount !== 3) setForm(f => ({ ...f, ...state.config }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
+  const save = async () => {
+    const ok = await command('/momentum/config', 'POST', form, '趋势参数已保存');
+    if (ok) await load();
+  };
+  const act = async (action: string, success: string) => {
+    const ok = await command('/momentum/action', 'POST', { action }, success);
+    if (ok) await load();
+  };
+  const dirLabel = (d: number | string) => d === 1 ? '做多' : d === -1 ? '做空' : d === 'NA' ? '待定' : '—';
+  const level = { info: '信息', warning: '注意', error: '错误' } as Record<string, string>;
+
+  return <>{state ? <div className="trend-page">
+    <section className="panel trend-panel"><PanelHeading title="趋势追踪引擎" description="独立于 Maker 网格的榜单动量策略；市价单跟随超趋势方向，反转反手、掉榜平仓"><div className="heading-actions"><button className={`button ${state.enabled ? 'secondary' : 'primary'}`} disabled={busy} onClick={() => act(state.enabled ? 'stop' : 'start', state.enabled ? '趋势引擎已停止' : '趋势引擎已启动')}>{state.enabled ? <><Pause size={15} />停止</> : <><Play size={15} />启动</>}</button><button className="button danger-ghost" disabled={busy || !state.positions.length} onClick={() => act('flatten', '已市价平掉全部趋势持仓')}><ArrowDownToLine size={15} />全部平仓</button></div></PanelHeading>
+      <div className="trend-top"><div className="trend-kpi"><span>状态</span><strong className={state.enabled ? 'positive' : ''}>{state.enabled ? '运行中' : '已停止'}</strong><small>{state.cycleCount} 轮</small></div><div className="trend-kpi"><span>下次轮询</span><strong>{state.config.tickSeconds} 秒</strong><small>{state.lastCycleAt ? time(state.lastCycleAt) : '尚未轮询'}</small></div><div className="trend-kpi"><span>每笔下注</span><strong>{state.config.orderNotional} U</strong><small>Supertrend {state.config.atrWindow} / {state.config.atrMultiplier}</small></div><div className="trend-kpi"><span>榜单范围</span><strong>前 {state.config.topCount} 名</strong><small>{state.config.quoteAssets.join(' / ')} · 涨跌幅</small></div>{state.lastError && <div className="trend-kpi error"><span>最近错误</span><strong>{state.lastError}</strong></div>}</div>
+      <div className="trend-settings"><div className="trend-settings-title"><TrendingUp size={15} />参数（即时生效）</div>
+        <Numeric label="榜单名次" value={form.topCount} onChange={v => setForm(f => ({ ...f, topCount: v }))} unit="名" min={1} max={10} step={1} />
+        <Numeric label="轮询间隔" value={form.tickSeconds} onChange={v => setForm(f => ({ ...f, tickSeconds: v }))} unit="秒" min={5} max={600} step={5} />
+        <Numeric label="每笔金额" value={form.orderNotional} onChange={v => setForm(f => ({ ...f, orderNotional: v }))} unit="U" min={0.5} max={100} step={0.5} />
+        <Numeric label="ATR 周期" value={form.atrWindow} onChange={v => setForm(f => ({ ...f, atrWindow: v }))} unit="根" min={2} max={20} step={1} />
+        <Numeric label="ATR 乘数" value={form.atrMultiplier} onChange={v => setForm(f => ({ ...f, atrMultiplier: v }))} unit="×" min={0.5} max={6} step={0.1} />
+        <div className="trend-field"><label>K 线周期</label><select value={form.interval} onChange={e => setForm(f => ({ ...f, interval: e.target.value }))}><option value="1m">1 分钟</option><option value="5m">5 分钟</option><option value="15m">15 分钟</option></select></div>
+        <div className="trend-field"><label>只做多模式（推荐）</label><button className={`toggle ${form.longOnly ? 'on' : ''}`} onClick={() => setForm(f => ({ ...f, longOnly: !f.longOnly }))} aria-pressed={form.longOnly}>{form.longOnly ? '开' : '关'}</button></div>
+        <Numeric label="追高保护（24h涨幅超此值跳过）" value={form.maxChasePct} onChange={v => setForm(f => ({ ...f, maxChasePct: v }))} unit="%" min={5} max={200} step={5} />
+        <Numeric label="持仓止损（浮亏超此值平仓）" value={form.stopLossPct} onChange={v => setForm(f => ({ ...f, stopLossPct: v }))} unit="%" min={0.5} max={50} step={0.5} />
+        <button className="button secondary" onClick={() => void save()} disabled={busy}><Check size={15} />保存参数</button>
+      </div></section>
+      <section className="panel"><PanelHeading title="当前持仓" description="以币安账户净持仓为准" />
+        {state.positions.length ? <div className="table-scroll"><table className="robot-table"><thead><tr><th>合约</th><th>方向</th><th>数量</th><th>开仓时间</th></tr></thead><tbody>{state.positions.map(p => <tr key={p.symbol}><td><strong>{p.symbol}</strong></td><td><span className={p.side === 'LONG' ? 'positive' : 'negative'}>{p.side === 'LONG' ? '多' : '空'}</span></td><td>{p.qty}</td><td>{p.openedAt ? time(p.openedAt) : '—'}</td></tr>)}</tbody></table></div> : <Empty title="当前无趋势持仓" detail="启动引擎后，将跟随榜单币的超趋势方向开仓" />}
+      </section>
+      <section className="panel"><PanelHeading title="最新榜单" description="按 |24h 涨跌幅| 排名 · 每轮刷新" />
+        <div className="table-scroll"><table className="robot-table"><thead><tr><th>#</th><th>合约</th><th>24h 涨跌幅</th><th>24h 成交额</th><th>超趋势方向</th><th>本轮动作</th></tr></thead><tbody>{state.lastRanking.map((r, i) => <tr key={r.symbol}><td><span className={`rank ${i < 3 ? 'top' : ''}`}>{String(i + 1).padStart(2, '0')}</span></td><td><strong>{r.symbol}</strong></td><td className={r.changePct >= 0 ? 'positive' : 'negative'}>{signed(r.changePct)}%</td><td>{compact(r.volume)}</td><td><span className={r.direction === 1 ? 'positive' : r.direction === -1 ? 'negative' : ''}>{dirLabel(r.direction)}</span></td><td className="small-muted">{r.reason}</td></tr>)}</tbody></table></div>{!state.lastRanking.length && <Empty title="榜单尚未生成" detail="启动引擎并等待一轮轮询" />}
+      </section>
+      <section className="panel"><PanelHeading title="运行记录" description="最近 80 条引擎事件" />
+        {state.events.length ? <div className="log-list">{state.events.slice().reverse().map((e, i) => <div className={`log-entry ${e.level}`} key={i}><div className="log-icon">{e.level === 'error' ? <CircleAlert size={16} /> : e.level === 'warning' ? <CircleAlert size={16} /> : <Activity size={16} />}</div><div className="log-body"><div><span className={`log-level ${e.level}`}>{level[e.level] ?? e.level}</span><span>趋势引擎</span></div><p>{e.message}</p></div><time>{time(e.time)}</time></div>)}</div> : <Empty title="暂无运行记录" detail="启动引擎后产生开平仓日志" />}
+      </section>
+    </div> : <div className="loading-screen"><p><LoaderCircle className="spin" size={15} />正在加载趋势引擎状态</p></div>}</>;
 }

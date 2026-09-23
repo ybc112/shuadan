@@ -85,11 +85,11 @@ export function defaultConfig(instrument: Instrument): RobotConfig {
   return {
     name: `${base} 移动网格`, symbol: instrument.symbol,
     sizingMode: 'quote', orderSize, contractSize: Number(instrument.quantityStep),
-    gridCount: 12, rangeMode: 'bps', halfRange: 60,
+    gridCount: 12, rangeMode: 'bps', halfRange: 120,
     recenterMinutes: 30, repriceSeconds: 15, orderTtlSeconds: 1800,
     closeOffsetMode: 'bps', closeLongOffset: 1, closeShortOffset: 1, leverage: 3, maxPositionNotional: 2000,
     maxOpenNotional: 2000, maxOrderNotional: 300,
-    stopLossQuote: 80, shockPercent: 1, cooldownSeconds: 60, makerFeeBps: 2, inventorySkew: 0, stopLossPercent: 3,
-    exitTimeoutSeconds: 0,
+    stopLossQuote: 80, shockPercent: 1, cooldownSeconds: 60, makerFeeBps: 0.5, inventorySkew: 0, stopLossPercent: 3,
+    exitTimeoutSeconds: 600,
   };
 }

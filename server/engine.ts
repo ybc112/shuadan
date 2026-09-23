@@ -81,6 +81,14 @@ export class MakerEngine {
   private liveBroker: LiveBroker | null = null;
   private liveSwitchInFlight = false;
   private lastTradesBySymbol = new Map<string, number>();
+  // 外部资金变动校准（入金/出金）。币安钱包余额变化 = 入金 + 已实现盈亏 + 手续费（返佣为负），
+  // 引擎对成交部分有精确的 realizedPnl/fees 累计，两者之差即「非交易资金流」。
+  // 若直接拿「当前余额 - 日内基准」当 dailyPnl，转入本金会被错记为当日盈利（实测 9-20 入金 40U
+  // 后 dailyPnl 虚增 +40）。把非交易资金流同步进 dailyStartEquity/peakEquity，让指标只反映交易结果。
+  // 阈值 1U 规避资金费率/BNB 抵扣等小幅噪声；live 切换（rebaseline）后重建基线。
+  private lastWalletSeen: Decimal | null = null;
+  private lastRealizedSeen: Decimal | null = null;
+  private lastFeesSeen: Decimal | null = null;
   // 独立成交流水（SQLite）。为 null 时引擎行为完全不变，便于测试与纸面运行。
   private tradeLog: TradeLogLike | null = null;
 
@@ -141,17 +149,23 @@ export class MakerEngine {
 
   accounts(): QuoteAccount[] {
     if (this.execution === 'live' && this.liveAccount) {
-      const wallets = this.liveAccount.assets.filter(a => ['USDT', 'USDC'].includes(a.asset));
+      const live = this.liveAccount;
+      const wallets = live.assets.filter(a => ['USDT', 'USDC'].includes(a.asset));
       const accounts: QuoteAccount[] = (['USDC', 'USDT'] as QuoteAsset[]).map(asset => {
         const a = wallets.find(w => w.asset === asset);
         if (!a) return { asset, wallet: '0', equity: '0', unrealizedPnl: '0', usedMargin: '0', available: '0' };
-        const used = this.robots.filter(r => r.symbol.endsWith(asset))
-          .reduce((sum, r) => {
-            const market = this.markets.find(m => m.symbol === r.symbol);
-            return sum.plus(positionNotional(r, market).div(r.leverage));
-          }, D(0));
-        return { asset, wallet: a.walletBalance, equity: a.marginBalance, unrealizedPnl: a.unrealizedProfit,
-          usedMargin: used.toFixed(), available: a.availableBalance };
+        // 本引擎 robots() 之外还有其它策略（如趋势引擎）在同一账户开仓，它们同样占用真实保证金。
+        // 只按本引擎挂单算 usedMargin 会低估占用，甚至当 marginBalance 被其它策略拉成负数时，
+        // 全局风控会把「0 > 负值×80%」判定为恒超限（实测 XRP 网格启动即被熔断）。
+        // 因此 live 口径下直接以币安账户余额为准：equity 钳到 0，占用用总初始保证金按钱包权重分摊。
+        const totalMargin = D(live.totalPositionInitialMargin);
+        const wallet = D(a.walletBalance);
+        const walletTotal = wallets.reduce((s, w) => s.plus(w.walletBalance), D(0));
+        const share = walletTotal.gt(0) ? wallet.div(walletTotal) : D(0);
+        const used = totalMargin.mul(share).toFixed();
+        const equity = Math.max(0, Number(a.marginBalance));
+        return { asset, wallet: a.walletBalance, equity: String(equity), unrealizedPnl: a.unrealizedProfit,
+          usedMargin: used, available: a.availableBalance };
       });
       return accounts;
     }
@@ -455,6 +469,8 @@ export class MakerEngine {
         // Re-baseline daily PnL against the live wallet so the global risk envelope does not fire on the first step.
         const liveEquity = D(account.totalWalletBalance).plus(account.totalUnrealizedProfit).toFixed();
         this.dailyStartEquity = liveEquity; this.peakEquity = liveEquity; this.day = new Date(now).toISOString().slice(0, 10);
+        // 重建外部资金基线：首次 live 同步会以当前钱包为基准，避免把存量余额误判为入金。
+        this.lastWalletSeen = null; this.lastRealizedSeen = null; this.lastFeesSeen = null;
         this.executionStatus = 'live';
       } else {
         for (const r of this.robots) this.cancelOrders(o => o.robotId === r.id, now);
@@ -507,12 +523,49 @@ export class MakerEngine {
         }
       }
       this.executionStatus = 'live';
+      this.calibrateExternalFlow(account, now);
     } catch (error) {
       this.executionStatus = 'error';
       this.executionMessage = error instanceof Error ? error.message : '同步账户失败';
       this.liveStatus = this.liveBroker.status();
       this.log('warning', 'live', `同步实盘账户失败：${this.executionMessage}`, undefined, now);
     }
+  }
+
+  /**
+   * 外部资金变动校准（入金/出金剥离）。
+   * 币安钱包余额变化 = 非交易资金流 + (Σ 实现盈亏 + 手续费净额)；引擎对后者有精确累计，
+   * 因此「钱包增量 − (ΣrealizedPnl 增量 + fees 增量)」即为入金/出金。
+   * 该部分必须从 dailyPnl/回撤基准中剔除：否则转入本金会被误记为当日盈利
+   * （实测 2026-09-20 转入 40 U 后 dailyPnl 虚增 +40，掩盖真实亏损）。
+   * 只在 live 模式下调用；首次同步只建立基线不判定；偏差小于阈值 1U 视为资金费率/BNB 抵扣噪声忽略。
+   */
+  private calibrateExternalFlow(account: { totalWalletBalance: string }, now: number) {
+    const wallet = D(account.totalWalletBalance);
+    let totalPnl = D(0), totalFees = D(0);
+    for (const r of this.robots) totalPnl = totalPnl.plus(r.realizedPnl);
+    totalFees = D(this.totalFees);
+    if (this.lastWalletSeen === null) {
+      // 重启后的首次同步没有「上次钱包」做增量对比。此时若 dailyStartEquity 仍是重启前基线，
+      // 而钱包里已包含未剥离的非交易资金（入金/出金），dailyPnl 会持续虚高/虚低
+      // （实测 2026-09-20 入金 40U，重启后 dailyPnl 恒显 +40）。把日内/回撤基准重定为当前权益，
+      // 让指标从当前实际资金起算；峰值保持不动避免丢失历史回撤，靠 enforceGlobal 实时再爬升。
+      const equity = wallet.plus(D(this.liveAccount?.totalUnrealizedProfit ?? '0'));
+      this.dailyStartEquity = equity.toFixed();
+      this.log('warning', 'live', `重启后首同步：日内基准重定为当前权益 ${equity.toFixed(2)} U（剥离非交易资金残差）`, undefined, now);
+      this.lastWalletSeen = wallet; this.lastRealizedSeen = totalPnl; this.lastFeesSeen = totalFees;
+      return;
+    }
+    const walletDelta = wallet.minus(this.lastWalletSeen);
+    const explained = totalPnl.minus(this.lastRealizedSeen ?? D(0)).plus(totalFees.minus(this.lastFeesSeen ?? D(0)));
+    const external = walletDelta.minus(explained);
+    this.lastWalletSeen = wallet; this.lastRealizedSeen = totalPnl; this.lastFeesSeen = totalFees;
+    // 阈值 1U：资金费率（每 8 小时约几厘）、BNB 抵扣手续费等都在这个量级以下。
+    if (external.abs().lte(1)) return;
+    // 入金/出金抬高或压低 wallet 余额，但不能算作交易盈亏，也不应计入回撤基准。
+    this.dailyStartEquity = D(this.dailyStartEquity).plus(external).toFixed();
+    this.peakEquity = D(this.peakEquity).plus(external).toFixed();
+    this.log('warning', 'live', `检测到非交易资金变动 ${external.toFixed(2)} U（入金/出金），已从当日盈亏与回撤基准中剥离`, undefined, now);
   }
 
   async syncLiveOrders(now = Date.now()): Promise<void> {

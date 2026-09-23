@@ -108,6 +108,89 @@ export function PanelHeading({ title, description, children }: { title: string; 
   return <div className="panel-heading"><div><h2>{title}</h2>{description && <p>{description}</p>}</div>{children}</div>;
 }
 
+/** 后端 /api/analytics 返回的逐笔成交序列元素 */
+export interface TradePoint { ts: number; price: number; buyQty: number; sellQty: number; buyCount: number; sellCount: number; realizedPnl: number; fee: number }
+/** 后端 /api/analytics 返回的权益快照元素 */
+export interface EquityPoint { ts: number; wallet: number; unrealized: number; marginUsed: number; markPrice: number }
+
+/**
+ * 交易分析与收益图表（工作台总览）。
+ * 上半：标记价格走势 + 成交散点（买绿/卖红），hover 高亮最近成交。
+ * 下半：权益曲线（含未实现盈亏）与累计已实现盈亏、累计返佣。
+ */
+export function TradeAnalytics({ trades, equity, symbol, hours }: {
+  trades: TradePoint[]; equity: EquityPoint[]; symbol: string; hours: number;
+}) {
+  const points = trades;
+  const hasTrades = points.length > 1;
+  const hasEquity = equity.length > 1;
+  const buyTotal = points.reduce((s, p) => s + p.buyQty, 0);
+  const sellTotal = points.reduce((s, p) => s + p.sellQty, 0);
+  const buyCount = points.reduce((s, p) => s + p.buyCount, 0);
+  const sellCount = points.reduce((s, p) => s + p.sellCount, 0);
+  const realized = points.reduce((s, p) => s + p.realizedPnl, 0);
+  const fees = points.reduce((s, p) => s + p.fee, 0);
+  const realizedCum: number[] = [0];
+  for (const p of points) realizedCum.push(realizedCum[realizedCum.length - 1] + p.realizedPnl + p.fee);
+
+  // —— 上半：价格走势 + 成交散点 ——
+  const W1 = 760, H1 = 210, left1 = 8, right1 = 82, top1 = 14, bottom1 = 28;
+  const first = points[0]?.ts ?? equity[0]?.ts ?? Date.now() - hours * 3600 * 1000;
+  const last = points[points.length - 1]?.ts ?? equity[equity.length - 1]?.ts ?? Date.now();
+  const t0 = first, t1 = last === first ? first + 1 : last;
+  const lowP = points.length ? Math.min(...points.map(p => p.price)) : hasEquity ? Math.min(...equity.map(e => e.markPrice || 0)) : 0;
+  const highP = points.length ? Math.max(...points.map(p => p.price)) : hasEquity ? Math.max(...equity.map(e => e.markPrice || 0)) : 0;
+  const spanP = Math.max(highP - lowP, highP * 0.004, 1e-9);
+  const xp = (ts: number) => left1 + (ts - t0) / (t1 - t0) * (W1 - left1 - right1);
+  const yp = (v: number) => top1 + (highP + spanP * 0.12 - v) / ((highP - lowP) + spanP * 0.24) * (H1 - top1 - bottom1);
+
+  // —— 下半：权益曲线 ——
+  const W2 = 760, H2 = 170, left2 = 8, right2 = 82, top2 = 12, bottom2 = 24;
+  const eqMin = hasEquity ? Math.min(...equity.map(e => e.wallet + e.unrealized)) : 0;
+  const eqMax = hasEquity ? Math.max(...equity.map(e => e.wallet + e.unrealized), realizedCum[realizedCum.length - 1]) : 1;
+  const spanQ = Math.max(eqMax - eqMin, Math.abs(eqMax) * 0.01, 1e-9);
+  const eqPoints = hasEquity ? equity.filter(e => e.ts >= first - 60000) : [];
+  const xq = (ts: number) => left2 + (ts - t0) / (t1 - t0) * (W2 - left2 - right2);
+  const yq = (v: number) => top2 + (eqMax + spanQ * 0.08 - v) / ((eqMax - eqMin) + spanQ * 0.16) * (H2 - top2 - bottom2);
+
+  const eqLine = eqPoints.map((e, i) => `${i ? 'L' : 'M'}${xq(e.ts).toFixed(2)},${yq(e.wallet + e.unrealized).toFixed(2)}`).join(' ');
+  const cumLine = points.map((p, i) => `${i ? 'L' : 'M'}${xp(p.ts).toFixed(2)},${yq(realizedCum[i + 1]).toFixed(2)}`).join(' ');
+
+  return <div className="analytics-grid">
+    <div className="analytics-card">
+      <div className="analytics-head"><div><strong>买卖成交 · {symbol || '全部交易对'}</strong><span>最近 {hours} 小时 · 买 {buyCount} / 卖 {sellCount} 笔</span></div>
+        <div className="analytics-stats"><span className="positive">买入 {buyTotal.toFixed(4)}</span><span className="negative">卖出 {sellTotal.toFixed(4)}</span></div></div>
+      {hasTrades ? <div className="analytics-chart">
+        <svg viewBox={`0 0 ${W1} ${H1}`} role="img" aria-label={`${symbol} 最近 ${hours} 小时成交分布`}>
+          {[0, 1, 2, 3, 4].map(i => { const v = highP + spanP * 0.12 - ((highP - lowP) + spanP * 0.24) * i / 4; return <g key={i}><line x1={left1} x2={W1 - right1} y1={yp(v)} y2={yp(v)} className="chart-grid" /><text x={W1 - right1 + 10} y={yp(v) + 3} className="chart-label">{price(v)}</text></g>; })}
+          {[0, 0.25, 0.5, 0.75, 1].map(p => { const ts = t0 + (t1 - t0) * p; return <text key={p} x={xp(ts)} y={H1 - 6} textAnchor={p === 0 ? 'start' : p === 1 ? 'end' : 'middle'} className="chart-label">{time(ts)}</text>; })}
+          <path d={points.map((p, i) => `${i ? 'L' : 'M'}${xp(p.ts).toFixed(2)},${yp(p.price).toFixed(2)}`).join(' ')} fill="none" stroke="#b9e997" strokeWidth="1.4" vectorEffect="non-scaling-stroke" opacity="0.85" />
+          {points.map((p, i) => p.buyQty > 0 || p.sellQty > 0 ? <g key={i}>
+            <circle cx={xp(p.ts)} cy={yp(p.price)} r={p.buyQty > 0 ? 3.2 : 2.6} fill={p.buyQty > 0 ? '#7ddb9c' : '#e58b96'} />
+            {(i === points.length - 1) && <circle cx={xp(p.ts)} cy={yp(p.price)} r="5" fill="none" stroke="#e2f7cf" strokeWidth="1.4" />}
+          </g> : null)}
+        </svg>
+      </div> : <Empty title="该范围暂无成交" detail={symbol ? '切换到其他交易对，或等网格成交后查看' : '待成交后展示买卖分布'} />}
+      <div className="analytics-foot"><span><i className="dot buy" />买入成交</span><span><i className="dot sell" />卖出成交</span><small>按币安成交流水（trades.db）统计</small></div>
+    </div>
+
+    <div className="analytics-card">
+      <div className="analytics-head"><div><strong>收益趋势</strong><span>最近 {hours} 小时</span></div>
+        <div className="analytics-stats"><span className={realized + fees >= 0 ? 'positive' : 'negative'}>已实现 {signed(realized + fees, 4)}</span></div></div>
+      {hasEquity || points.length > 1 ? <div className="analytics-chart">
+        <svg viewBox={`0 0 ${W2} ${H2}`} role="img" aria-label="权益与累计收益曲线">
+          {[0, 1, 2, 3].map(i => { const v = eqMax + spanQ * 0.08 - ((eqMax - eqMin) + spanQ * 0.16) * i / 3; return <g key={i}><line x1={left2} x2={W2 - right2} y1={yq(v)} y2={yq(v)} className="chart-grid" /><text x={W2 - right2 + 10} y={yq(v) + 3} className="chart-label">{money(v, 2)}</text></g>; })}
+          {[0, 0.25, 0.5, 0.75, 1].map(p => { const ts = t0 + (t1 - t0) * p; return <text key={p} x={xq(ts)} y={H2 - 4} textAnchor={p === 0 ? 'start' : p === 1 ? 'end' : 'middle'} className="chart-label">{time(ts)}</text>; })}
+          {hasEquity && <path d={eqLine} fill="none" stroke="#9cc7e8" strokeWidth="1.6" vectorEffect="non-scaling-stroke" opacity="0.9" />}
+          {points.length > 1 && <path d={cumLine} fill="none" stroke="#e7b46f" strokeWidth="1.6" vectorEffect="non-scaling-stroke" opacity="0.95" />}
+          {hasEquity && eqPoints.map((e, i) => i % 20 === 0 && <circle key={i} cx={xq(e.ts)} cy={yq(e.wallet + e.unrealized)} r="1.8" fill="#9cc7e8" opacity="0.5" />)}
+        </svg>
+      </div> : <Empty title="权益数据为空" detail="实盘运行中每分钟记录一次权益快照" />}
+      <div className="analytics-foot"><span><i className="line blue" />账户权益（含浮盈）</span><span><i className="line amber" />累计已实现收益</span><small>含手续费与返佣净额</small></div>
+    </div>
+  </div>;
+}
+
 export function External({ href, children }: { href: string; children: ReactNode }) {
   return <a href={href} target="_blank" rel="noreferrer" className="text-link">{children}<ArrowUpRight size={14} /></a>;
 }

@@ -20,6 +20,7 @@ import { NewsCollector, makeBinanceNewsFetcher } from './info-news';
 import { LlmClient } from './llm-client';
 import { makeSearchClient } from './web-search';
 import { AiRunner } from './ai-runner';
+import { MomentumEngine } from './momentum';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const localEnvironment = path.join(root, '.env.local');
@@ -65,6 +66,11 @@ let tradingClient: BinanceTradingClient;
   tradingClient = new BinanceTradingClient(loaded.config);
 }
 engine.attachLiveBroker(tradingClient);
+
+// ===== 趋势榜单引擎（momentum）：独立的排行榜动量策略 =====
+// 每 N 秒扫 24h 涨跌幅榜前 K 名，Supertrend(1m) 定方向做多/做空，掉榜平仓，趋势翻转反手。
+// 与 MakerEngine 完全独立。
+const momentum = new MomentumEngine(tradingClient);
 
 // ===== AI 策略指挥官（量化决策层）=====
 // 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
@@ -150,6 +156,40 @@ app.get('/api/health', (_req, res) => res.json({ ok: !persistenceFailed, executi
 app.get('/api/state', (_req, res) => res.json({ ...engine.snapshot(), sessionToken }));
 app.get('/api/binance/status', (_req, res) => res.json(inspector.status()));
 app.get('/api/ai/status', (_req, res) => res.json({ ...aiRunner.status, recent: aiRunner.recentHistory(20) }));
+// 历史成交与权益分析（SQLite trades.db）。只读、可无 token 访问（与 GET /api/state 同级）。
+// hours：回溯小时数；symbol：可选过滤交易对（默认全部）。返回成交序列 + 权益曲线。
+app.get('/api/analytics', (req, res) => {
+  const hours = z.coerce.number().min(1).max(24 * 30).catch(24).parse(req.query.hours);
+  const symbol = z.string().regex(/^[A-Z0-9]{3,30}$/).optional().parse(req.query.symbol);
+  const from = Date.now() - hours * 3600 * 1000;
+  const trades = symbol ? tradeLog.symbolSeries(symbol, from) : [];
+  const equity = tradeLog.equitySeries(from);
+  // 全部符号下给出逐合约成交统计（用于总览卡片）
+  const bySymbol: Record<string, { count: number; fee: number; realizedPnl: number }> = {};
+  if (!symbol) {
+    for (const t of tradeLog.recentTrades(5000)) {
+      bySymbol[t.symbol] ??= { count: 0, fee: 0, realizedPnl: 0 };
+      bySymbol[t.symbol].count += 1; bySymbol[t.symbol].fee += Number(t.fee); bySymbol[t.symbol].realizedPnl += Number(t.realizedPnl);
+    }
+  }
+  res.json({ hours, symbol: symbol ?? null, from, trades, equity, bySymbol });
+});
+
+// ===== 趋势榜单引擎 API =====
+app.get('/api/momentum/status', (_req, res) => res.json({ ...momentum.state }));
+app.post('/api/momentum/config', async (req, res) => {
+  const body = req.body ?? {};
+  if (typeof body !== 'object' || Array.isArray(body)) throw new Error('参数必须是对象');
+  momentum.updateConfig(body);
+  res.json({ ok: true, config: momentum.state.config });
+});
+app.post('/api/momentum/action', async (req, res) => {
+  const { action } = z.object({ action: z.enum(['start', 'stop', 'flatten', 'cycle']) }).strict().parse(req.body);
+  if (action === 'start') { await momentum.start(); res.json({ ok: true, enabled: momentum.state.enabled }); return; }
+  if (action === 'stop') { await momentum.stop(); res.json({ ok: true, enabled: false }); return; }
+  if (action === 'flatten') { await momentum.flatten(); res.json({ ok: true, positions: momentum.state.positions }); return; }
+  await momentum.cycle(); res.json({ ok: true, ranking: momentum.state.lastRanking, positions: momentum.state.positions });
+});
 app.post('/api/binance/check', (req, res) => {
   const input = z.object({ symbol: symbolSchema.default('BTCUSDT'), includeAccount: z.boolean().default(false) }).strict().parse(req.body);
   res.status(202).json(inspector.start(input.symbol, input.includeAccount));
@@ -164,6 +204,12 @@ app.post('/api/robots/:id/action', (req, res) => {
   if (action === 'pause') engine.pauseRobot(req.params.id);
   if (action === 'reduce') engine.reduceRobot(req.params.id);
   save(); res.json({ ok: true });
+});
+app.post('/api/robots/:id/ai-params', (req, res) => {
+  const body = req.body ?? {};
+  if (typeof body !== 'object' || Array.isArray(body)) throw new Error('参数必须是对象');
+  const robot = engine.applyLiveParams(req.params.id, body);
+  save(); res.json({ ok: true, robot: { id: robot.id, symbol: robot.symbol, status: robot.status } });
 });
 app.post('/api/batch-create', (req, res) => {
   const { quoteAsset } = z.object({ quoteAsset: z.enum(['USDC', 'USDT']) }).strict().parse(req.body);
@@ -211,27 +257,6 @@ app.post('/api/live/config', (req, res) => {
   liveCredentialsSource = 'file';
   tradingClient.configure(effective);
   engine.attachLiveBroker(tradingClient);
-
-// ===== AI 策略指挥官（量化决策层）=====
-// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
-// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
-const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
-const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
-const aiNews = new NewsCollector(makeBinanceNewsFetcher());
-const aiSearch = makeSearchClient(process.env);
-const aiLlm = LlmClient.fromEnv(process.env);
-const aiRunner = new AiRunner({
-  engine,
-  klines: aiKlines,
-  news: aiNews,
-  llm: aiLlm,
-  search: aiSearch,
-  dataDir: aiDataDir,
-  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
-  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
-  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
-  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
-});
   res.json({ ok: true, configured: tradingClient.configured, configurationIssue: tradingClient.configurationIssue,
     environment: tradingClient.environment, keyTail: tradingClient.apiKeyTail(), source: 'file' });
 });
@@ -242,27 +267,6 @@ app.post('/api/live/config/clear', (_req, res) => {
   const fallback: TradingConfig = fromEnv.apiKey && fromEnv.apiSecret ? fromEnv : { environment: 'demo' };
   tradingClient.configure(fallback);
   engine.attachLiveBroker(tradingClient);
-
-// ===== AI 策略指挥官（量化决策层）=====
-// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
-// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
-const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
-const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
-const aiNews = new NewsCollector(makeBinanceNewsFetcher());
-const aiSearch = makeSearchClient(process.env);
-const aiLlm = LlmClient.fromEnv(process.env);
-const aiRunner = new AiRunner({
-  engine,
-  klines: aiKlines,
-  news: aiNews,
-  llm: aiLlm,
-  search: aiSearch,
-  dataDir: aiDataDir,
-  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
-  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
-  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
-  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
-});
   liveCredentialsSource = fromEnv.apiKey && fromEnv.apiSecret ? 'env' : 'none';
   res.json({ ok: true, configured: tradingClient.configured });
 });
@@ -302,27 +306,6 @@ app.post('/api/reset', (req, res) => {
   z.object({ confirmation: z.literal('RESET') }).strict().parse(req.body);
   binance.reset(); simulation = new SimulatedFeed(); engine = new MakerEngine();
   engine.attachLiveBroker(tradingClient);
-
-// ===== AI 策略指挥官（量化决策层）=====
-// 数据层：币安 K线（fapi）+ 官方公告；币安广场公开接口被反爬阻断 → 由联网搜索(AI)降级补齐。
-// 决策层：DeepSeek(OpenAI 兼容) + 可选搜索，全链路故障静默，不影响引擎主循环。
-const aiDataDir = process.env.MAKER_DATA_DIR ?? path.join(root, 'data');
-const aiKlines = new KlineCollector(makeBinanceKlinesFetcher({ endpoint: 'fapi' }));
-const aiNews = new NewsCollector(makeBinanceNewsFetcher());
-const aiSearch = makeSearchClient(process.env);
-const aiLlm = LlmClient.fromEnv(process.env);
-const aiRunner = new AiRunner({
-  engine,
-  klines: aiKlines,
-  news: aiNews,
-  llm: aiLlm,
-  search: aiSearch,
-  dataDir: aiDataDir,
-  intervalMinutes: z.coerce.number().min(1).max(1440).catch(45).parse(process.env.LLM_INTERVAL_MIN ?? '45'),
-  enabled: String(process.env.AI_ADMIN_ENABLED ?? '').toLowerCase() === 'true',
-  searchProvider: String(process.env.SEARCH_PROVIDER || 'none'),
-  symbols: String(process.env.AI_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
-});
   engine.attachTradeLog(tradeLog);
   engine.log('warning', 'system', '用户重置了工作台数据，恢复到空白初始状态');
   save(); res.json({ ok: true });
